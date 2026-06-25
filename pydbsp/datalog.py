@@ -26,7 +26,7 @@ v2 layout, with the v1 evaluator/stream imports stripped.
 """
 
 from functools import total_ordering
-from typing import Any, NewType, TypeAlias, cast
+from typing import Any, Callable, NewType, TypeAlias, cast
 
 from pydbsp.zset import ZSet
 
@@ -240,6 +240,71 @@ def unify(atom: Atom, fact: Fact) -> Rewrite | None:
         elif term != constant:
             return None
     return Rewrite(bindings)
+
+
+# ---- Interpreted (built-in) predicates: lazily-evaluated infinite relations -
+#
+# A predicate like ``lt`` denotes the INFINITE relation ``{(a, b) : a < b}`` — it
+# has infinite support, so it can never be a (finite) ZSet of facts. Instead it is
+# an *interpreted* predicate: a decidable guard evaluated on bindings already
+# produced by finite positive atoms. Range-restriction (every argument bound by a
+# preceding positive body atom — see :func:`check_interpreted_safety`) keeps the
+# join finite and the guard TOTAL over ground values. The body operators route
+# these atoms to a stateless select (no facts-join, no delay), exactly parallel to
+# negation's pass-through branch — so the infinite relation never becomes an operand.
+
+INTERPRETED: dict[str, Callable[..., bool]] = {
+    "lt": lambda a, b: a < b,
+    "le": lambda a, b: a <= b,
+    "gt": lambda a, b: a > b,
+    "ge": lambda a, b: a >= b,
+    "neq": lambda a, b: a != b,
+}
+
+
+def register_interpreted(name: str, fn: Callable[..., bool]) -> None:
+    """Register an interpreted predicate ``name`` → a decidable guard ``fn``."""
+    INTERPRETED[name] = fn
+
+
+def eval_interpreted(atom: Atom, rewrite: "Rewrite") -> bool:
+    """Evaluate an interpreted atom under ``rewrite``. Safety guarantees every arg is
+    ground, so this is a total Boolean function of the bound values."""
+    return INTERPRETED[atom[0]](*rewrite.apply(atom)[1])
+
+
+def _term_vars(terms: tuple[Term, ...]) -> set[Variable]:
+    """Variables occurring in ``terms`` (recursing into Skolem args)."""
+    out: set[Variable] = set()
+    for t in terms:
+        if is_variable(t):
+            out.add(cast(Variable, t))
+        elif type(t) is Skolem:
+            out |= _term_vars(t.args)
+    return out
+
+
+def check_interpreted_safety(program: "ZSet[Rule]") -> None:
+    """Reject any rule where an interpreted atom's arguments are not ALL bound by a
+    preceding positive (non-interpreted, non-negated) body atom. Safety is what makes
+    the interpreted guard total over ground values — without it the guard would meet
+    an unbound ``?var`` and compare a string."""
+    for rule, w in program.inner.items():
+        if w <= 0:
+            continue
+        bound: set[Variable] = set()
+        for atom in rule[1:]:
+            pred = atom[0]
+            if pred in INTERPRETED:
+                unbound = _term_vars(atom[1]) - bound
+                if unbound:
+                    raise ValueError(
+                        f"unsafe interpreted atom {pred}{atom[1]} in rule with head "
+                        f"{rule[0]}: {sorted(unbound)} not bound by a preceding positive atom"
+                    )
+            elif not pred.startswith("!"):
+                bound |= _term_vars(atom[1])
+    return None
 
 
 # ---- Program-derived functions ---------------------------------------------

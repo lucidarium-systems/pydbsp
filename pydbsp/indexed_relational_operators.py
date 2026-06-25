@@ -712,11 +712,22 @@ class IndexedIncrementalDatalogWithNegationBody(Operator):
         ).connect(circuit, (indexed_facts_raw,))
 
         positive_atoms = LiftLiftSelect[dli.IndexedGatekeepEntry](
-            pred=lambda gk: gk[1] is None or ("!" not in gk[1][0])
+            pred=lambda gk: gk[1] is None or ("!" not in gk[1][0] and gk[1][0] not in dlg.INTERPRETED)
         ).connect(circuit, (gatekeep,))
         negative_atoms = LiftLiftSelect[dli.IndexedGatekeepEntry](
             pred=lambda gk: not (gk[1] is None or ("!" not in gk[1][0]))
         ).connect(circuit, (gatekeep,))
+        # interpreted (built-in) atoms — a stateless GUARD on the rewrite: select the
+        # gatekeep entries whose decidable predicate holds under their (ground, by
+        # safety) bindings, then project to the UNCHANGED rewrite. No facts-join, no
+        # delay → the infinite relation never materializes.
+        interp_satisfied = LiftLiftSelect[dli.IndexedGatekeepEntry](
+            pred=lambda gk: gk[1] is not None and gk[1][0] in dlg.INTERPRETED and dlg.eval_interpreted(gk[1], gk[2])
+        ).connect(circuit, (gatekeep,))
+        interp_proj = LiftLiftProject[
+            dli.IndexedGatekeepEntry,
+            dlg.ProvenanceIndexedRewrite,
+        ](f=lambda gk: (gk[0], gk[2])).connect(circuit, (interp_satisfied,))
 
         gatekeep_idx_group = IndexedZSetAddition[
             dli.JoinKey,
@@ -780,11 +791,17 @@ class IndexedIncrementalDatalogWithNegationBody(Operator):
             ZSet[dlg.ProvenanceIndexedRewrite],
             ZSet[dlg.ProvenanceIndexedRewrite],
         ](f=self.rewrite_group.neg).connect(circuit, (anti_product,))
-        final_product = Lift2[
+        final_product_neg = Lift2[
             ZSet[dlg.ProvenanceIndexedRewrite],
             ZSet[dlg.ProvenanceIndexedRewrite],
             ZSet[dlg.ProvenanceIndexedRewrite],
         ](op=self.rewrite_group.add).connect(circuit, (product_plus_proj, neg_anti))
+        # final_product = product + proj − anti_product + interp_proj
+        final_product = Lift2[
+            ZSet[dlg.ProvenanceIndexedRewrite],
+            ZSet[dlg.ProvenanceIndexedRewrite],
+            ZSet[dlg.ProvenanceIndexedRewrite],
+        ](op=self.rewrite_group.add).connect(circuit, (final_product_neg, interp_proj))
 
         indexed_final_product = LiftIndex[
             dlg.ProvenanceIndexedRewrite,

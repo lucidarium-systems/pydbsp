@@ -86,8 +86,8 @@ def _extract_pos_dep_pairs(
         head_pred = rule[0][0]
         for atom in rule[1:]:
             body_pred = atom[0]
-            if body_pred.startswith("!"):
-                continue
+            if body_pred.startswith("!") or body_pred in dlg.INTERPRETED:
+                continue  # interpreted predicates are guards, not relations → no dep edge
             key = (head_pred, body_pred)
             out[key] = out.get(key, 0) + w
     return ZSet({k: v for k, v in out.items() if v != 0})
@@ -571,13 +571,34 @@ class IncrementalDatalogBodyWithNegation(Operator):
             ZSet[dlg.AtomWithSourceRewriteAndProvenance],
             ZSet[dlg.AtomWithSourceRewriteAndProvenance],
         ](
-            f=lambda z: ZSet({gk: w for gk, w in z.inner.items() if gk[1] is None or "!" not in gk[1][0]}),
+            f=lambda z: ZSet(
+                {
+                    gk: w
+                    for gk, w in z.inner.items()
+                    if gk[1] is None or ("!" not in gk[1][0] and gk[1][0] not in dlg.INTERPRETED)
+                }
+            ),
         ).connect(circuit, (gatekeep,))
         negative_atoms = Lift1[
             ZSet[dlg.AtomWithSourceRewriteAndProvenance],
             ZSet[dlg.AtomWithSourceRewriteAndProvenance],
         ](
             f=lambda z: ZSet({gk: w for gk, w in z.inner.items() if not (gk[1] is None or "!" not in gk[1][0])}),
+        ).connect(circuit, (gatekeep,))
+        # interpreted (built-in) atoms — a stateless guard on the rewrite: keep the
+        # gatekeep entries whose decidable predicate holds under their (ground, by
+        # safety) bindings, projected to the unchanged rewrite. No facts-join, no delay.
+        interp_proj = Lift1[
+            ZSet[dlg.AtomWithSourceRewriteAndProvenance],
+            ZSet[dlg.ProvenanceIndexedRewrite],
+        ](
+            f=lambda z: ZSet(
+                {
+                    (gk[0], gk[2]): w
+                    for gk, w in z.inner.items()
+                    if gk[1] is not None and gk[1][0] in dlg.INTERPRETED and dlg.eval_interpreted(gk[1], gk[2])
+                }
+            ),
         ).connect(circuit, (gatekeep,))
 
         product = DeltaLiftedDeltaLiftedDeltaLiftedJoin[
@@ -626,11 +647,17 @@ class IncrementalDatalogBodyWithNegation(Operator):
             ZSet[dlg.ProvenanceIndexedRewrite],
             ZSet[dlg.ProvenanceIndexedRewrite],
         ](f=self.rewrite_group.neg).connect(circuit, (anti_product,))
-        final_product = Lift2[
+        final_product_neg = Lift2[
             ZSet[dlg.ProvenanceIndexedRewrite],
             ZSet[dlg.ProvenanceIndexedRewrite],
             ZSet[dlg.ProvenanceIndexedRewrite],
         ](op=self.rewrite_group.add).connect(circuit, (product_plus_proj, neg_anti))
+        # final_product = product + proj − anti_product + interp_proj
+        final_product = Lift2[
+            ZSet[dlg.ProvenanceIndexedRewrite],
+            ZSet[dlg.ProvenanceIndexedRewrite],
+            ZSet[dlg.ProvenanceIndexedRewrite],
+        ](op=self.rewrite_group.add).connect(circuit, (final_product_neg, interp_proj))
 
         ground = DeltaLiftedDeltaLiftedDeltaLiftedJoin[
             dlg.ProvenanceIndexedRewrite,
@@ -734,10 +761,22 @@ class IndexedIncrementalDatalogBodyWithNegation(Operator):
         ).connect(circuit, (indexed_facts_raw,))
 
         positive_atoms = Lift1[ZSet[dlg.IndexedGatekeepEntry], ZSet[dlg.IndexedGatekeepEntry]](
-            f=lambda z: ZSet({gk: w for gk, w in z.inner.items() if gk[1] is None or "!" not in gk[1][0]})
+            f=lambda z: ZSet(
+                {gk: w for gk, w in z.inner.items() if gk[1] is None or ("!" not in gk[1][0] and gk[1][0] not in dlg.INTERPRETED)}
+            )
         ).connect(circuit, (gatekeep,))
         negative_atoms = Lift1[ZSet[dlg.IndexedGatekeepEntry], ZSet[dlg.IndexedGatekeepEntry]](
             f=lambda z: ZSet({gk: w for gk, w in z.inner.items() if not (gk[1] is None or "!" not in gk[1][0])})
+        ).connect(circuit, (gatekeep,))
+        # interpreted (built-in) atoms — stateless guard, projected to the unchanged rewrite.
+        interp_proj = Lift1[ZSet[dlg.IndexedGatekeepEntry], ZSet[dlg.ProvenanceIndexedRewrite]](
+            f=lambda z: ZSet(
+                {
+                    (gk[0], gk[2]): w
+                    for gk, w in z.inner.items()
+                    if gk[1] is not None and gk[1][0] in dlg.INTERPRETED and dlg.eval_interpreted(gk[1], gk[2])
+                }
+            )
         ).connect(circuit, (gatekeep,))
 
         gatekeep_idx_group = IndexedZSetAddition[dlg.JoinKey, dlg.IndexedGatekeepEntry](self.gatekeep_group, dlg._gatekeep_join_key)
@@ -769,9 +808,13 @@ class IndexedIncrementalDatalogBodyWithNegation(Operator):
             op=self.rewrite_group.add
         ).connect(circuit, (product, proj))
         neg_anti = Lift1[ZSet[dlg.ProvenanceIndexedRewrite], ZSet[dlg.ProvenanceIndexedRewrite]](f=self.rewrite_group.neg).connect(circuit, (anti_product,))
-        final_product = Lift2[ZSet[dlg.ProvenanceIndexedRewrite], ZSet[dlg.ProvenanceIndexedRewrite], ZSet[dlg.ProvenanceIndexedRewrite]](
+        final_product_neg = Lift2[ZSet[dlg.ProvenanceIndexedRewrite], ZSet[dlg.ProvenanceIndexedRewrite], ZSet[dlg.ProvenanceIndexedRewrite]](
             op=self.rewrite_group.add
         ).connect(circuit, (product_plus_proj, neg_anti))
+        # final_product = product + proj − anti_product + interp_proj
+        final_product = Lift2[ZSet[dlg.ProvenanceIndexedRewrite], ZSet[dlg.ProvenanceIndexedRewrite], ZSet[dlg.ProvenanceIndexedRewrite]](
+            op=self.rewrite_group.add
+        ).connect(circuit, (final_product_neg, interp_proj))
 
         # ground: final_product ⋈ sig on provenance → facts
         indexed_final_product = LiftIndex[dlg.ProvenanceIndexedRewrite, dlg.Provenance](indexer=lambda r: r[0]).connect(circuit, (final_product,))
@@ -1183,6 +1226,7 @@ class IncrementalDatalogStratified:
             self._rule_group.add(self._pending_rules, rules),
         )
         _check_stratifiable(new_program)
+        dlg.check_interpreted_safety(new_program)
         self._pending_rules = self._rule_group.add(
             self._pending_rules,
             rules,
@@ -1383,8 +1427,10 @@ class IndexedDatalogWithNegation:
         self._facts: ZSet[dlg.Fact] = ZSet({})
 
     def push_rules(self, rules: ZSet[dlg.Rule]) -> None:
-        _check_stratifiable(self._rule_group.add(self._rules, rules))
-        self._rules = self._rule_group.add(self._rules, rules)
+        merged = self._rule_group.add(self._rules, rules)
+        _check_stratifiable(merged)
+        dlg.check_interpreted_safety(merged)
+        self._rules = merged
 
     def push_facts(self, facts: ZSet[dlg.Fact]) -> None:
         self._facts = self._fact_group.add(self._facts, facts)
