@@ -32,7 +32,13 @@ from pydbsp.circuit import Circuit
 from pydbsp.compute import ComputeCtx
 from pydbsp.core import Antichain, dbsp_time
 from pydbsp.evaluate import Evaluator
-from pydbsp.indexed_relational_operators import LiftGroupBy, LiftIndex
+from pydbsp.indexed_relational_operators import (
+    IndexedDeltaLiftedDeltaLiftedDeltaLiftedJoin,
+    IndexedIncrementalDatalogWithNegationBody,
+    LiftGroupBy,
+    LiftIndex,
+)
+from pydbsp.indexed_zset import IndexedZSetAddition
 from pydbsp.operator import (
     CoreDelay,
     CoreDifferentiate,
@@ -164,6 +170,36 @@ def _without_internal_facts(z: ZSet[dlg.Fact]) -> ZSet[dlg.Fact]:
     return ZSet({fact: w for fact, w in z.inner.items() if fact[0] != _STRATUM_READY_PRED and w != 0})
 
 
+def _tainted_positions(program: ZSet[dlg.Rule]) -> set[tuple[str, int]]:
+    """The set of ``(predicate, arg-index)`` positions that can carry an
+    INVENTED (Skolem-constructed) value. Seeds every head position occupied by
+    a Skolem term, then propagates through plain-variable head copies to a
+    fixpoint. Used by the generative-recursion check to tell EDB-grounded key
+    positions apart from invented value positions."""
+    tainted: set[tuple[str, int]] = set()
+    rules = [r for r, w in program.inner.items() if w > 0]
+    for rule in rules:
+        hp = rule[0][0]
+        for i, a in enumerate(rule[0][1]):
+            if type(a) is dlg.Skolem:
+                tainted.add((hp, i))
+    changed = True
+    while changed:
+        changed = False
+        for rule in rules:
+            hp = rule[0][0]
+            for i, a in enumerate(rule[0][1]):
+                if not dlg.is_variable(a) or (hp, i) in tainted:
+                    continue
+                for batom in rule[1:]:
+                    bp = batom[0].lstrip("!")
+                    if any(bt == a and (bp, j) in tainted for j, bt in enumerate(batom[1])):
+                        tainted.add((hp, i))
+                        changed = True
+                        break
+    return tainted
+
+
 def _check_stratifiable(program: ZSet[dlg.Rule]) -> None:
     """Reject a program if its predicate-dependency graph contains a
     cycle through negation. Tarjan SCC over the combined positive +
@@ -236,6 +272,70 @@ def _check_stratifiable(program: ZSet[dlg.Rule]) -> None:
                     f"within SCC {sorted(scc)} via neg edge "
                     f"{src!r} → {dst!r}"
                 )
+
+    # Generative (Skolem-bearing) heads INVENT terms, and function symbols make
+    # Datalog Turing-complete — so generative recursion can derive unbounded
+    # terms. But the structural transpiler rule
+    #   py_expr(N, infix(Op,La,Ra)) :- c_binary(N,Op,L,R), py_expr(L,La), py_expr(R,Ra)
+    # terminates: the recursion KEY (the node id) strictly DESCENDS an EDB
+    # relation (N → L,R via c_binary), so the invented value rides a VALUE
+    # position and never drives the loop. Reject a generative cyclic SCC only
+    # when it is NOT key-grounded by such a descent — the head has no untainted
+    # EDB-bound key, or some recursive (in-SCC) atom fails to descend to a
+    # DIFFERENT EDB-bound key. (Sound provided the descent EDB relations are
+    # acyclic — always true for an AST; `max_inner` bounds any violation.)
+    # A no-op for any program without Skolems.
+    generative_rules = [
+        rule
+        for rule, w in program.inner.items()
+        if w > 0 and any(type(a) is dlg.Skolem for a in rule[0][1])
+    ]
+    if generative_rules:
+        tainted = _tainted_positions(program)
+        scc_of = {p: frozenset(scc) for scc in sccs for p in scc}
+        cyclic: set[str] = set()
+        for scc in sccs:
+            if len(scc) > 1 or next(iter(scc)) in all_edges.get(next(iter(scc)), ()):
+                cyclic |= scc
+        for rule in generative_rules:
+            hp = rule[0][0]
+            if hp not in cyclic:
+                continue  # acyclic generative head — always terminating
+            s = scc_of[hp]
+            # vars bound at an untainted position by an out-of-SCC (EDB / lower
+            # stratum) positive body atom — the EDB-grounded keys.
+            edb_bound = {
+                bt
+                for batom in rule[1:]
+                if not batom[0].startswith("!") and batom[0] not in s
+                for j, bt in enumerate(batom[1])
+                if dlg.is_variable(bt) and (batom[0], j) not in tainted
+            }
+            head_keys = {
+                a
+                for i, a in enumerate(rule[0][1])
+                if dlg.is_variable(a) and (hp, i) not in tainted and a in edb_bound
+            }
+            if not head_keys:
+                raise ValueError(
+                    f"Program is not stratifiable: recursive term construction "
+                    f"in cyclic SCC {sorted(s)} is not key-grounded — head {hp!r} "
+                    f"has no untainted EDB-bound key to descend."
+                )
+            for batom in rule[1:]:
+                if batom[0].startswith("!") or batom[0] not in s:
+                    continue  # only recursive (in-SCC) atoms must descend
+                descended = any(
+                    dlg.is_variable(bt) and (batom[0], j) not in tainted and bt in edb_bound and bt not in head_keys
+                    for j, bt in enumerate(batom[1])
+                )
+                if not descended:
+                    raise ValueError(
+                        f"Program is not stratifiable: recursive term construction "
+                        f"in cyclic SCC {sorted(s)} is not key-grounded — recursive "
+                        f"atom {batom[0]!r} does not descend to a new EDB-bound key "
+                        f"(the invented value would drive the recursion)."
+                    )
 
 
 @dataclass(frozen=True)
@@ -567,6 +667,134 @@ class IncrementalDatalogBodyWithNegation(Operator):
         ](op=lambda a, b: (a, b)).connect(circuit, (next_facts, next_rewrites))
 
 
+@dataclass(frozen=True)
+class IndexedIncrementalDatalogBodyWithNegation(Operator):
+    """SORT-MERGE-INDEXED 3-D (outer, stratum, inner) negation body — the indexed
+    analog of :class:`IncrementalDatalogBodyWithNegation`. Byte-for-byte the same
+    body, with every :class:`DeltaLiftedDeltaLiftedDeltaLiftedJoin` replaced by an
+    :class:`~pydbsp.indexed_relational_operators.IndexedDeltaLiftedDeltaLiftedDeltaLiftedJoin`
+    (operands pre-indexed via :class:`LiftIndex`), exactly as the 2-D
+    :class:`~pydbsp.indexed_relational_operators.IndexedIncrementalDatalogWithNegationBody`
+    indexes the 2-D plain body. Produces the SAME ``(facts_diff, rewrites_diff)`` IDB;
+    only the join cost changes (O(matching keys) vs O(|left|·|right|)).
+
+    ``inputs = (edb_1d, program_3d, state_facts_3d, state_rewrites_3d, seed_1d)``."""
+
+    fact_group: ZSetAddition[dlg.Fact]
+    rule_group: ZSetAddition[dlg.Rule]
+    rewrite_group: ZSetAddition[dlg.ProvenanceIndexedRewrite]
+    signal_group: ZSetAddition[dlg.Signal]
+    ext_dir_group: ZSetAddition[dlg.ExtendedDirection]
+    jorder_group: ZSetAddition[tuple[str, dlg.ColumnReference]]
+    gatekeep_group: ZSetAddition[dlg.IndexedGatekeepEntry]
+    indexed_fact_group: ZSetAddition[dlg.IndexedFact]
+
+    def connect(self, circuit: Circuit[Time], inputs: tuple[NodeId, ...]) -> NodeId:
+        if len(inputs) != 5:
+            raise ValueError(f"IndexedIncrementalDatalogBodyWithNegation takes 5 inputs; got {len(inputs)}")
+        edb_1d, program_3d, state_facts_3d, state_rewrites_3d, seed_1d = inputs
+
+        edb_2d = LiftStreamIntroduction[ZSet[dlg.Fact]](group=self.fact_group).connect(circuit, (edb_1d,))
+        edb_3d = LiftStreamIntroduction[ZSet[dlg.Fact]](group=self.fact_group).connect(circuit, (edb_2d,))
+        seed_2d = LiftStreamIntroduction[ZSet[dlg.ProvenanceIndexedRewrite]](group=self.rewrite_group).connect(circuit, (seed_1d,))
+        seed_3d = LiftStreamIntroduction[ZSet[dlg.ProvenanceIndexedRewrite]](group=self.rewrite_group).connect(circuit, (seed_2d,))
+
+        delayed_facts = CoreDelay[ZSet[dlg.Fact]](axis=2, group=self.fact_group).connect(circuit, (state_facts_3d,))
+        delayed_rewrites = CoreDelay[ZSet[dlg.ProvenanceIndexedRewrite]](axis=2, group=self.rewrite_group).connect(circuit, (state_rewrites_3d,))
+
+        sig_3d = Lift1[ZSet[dlg.Rule], ZSet[dlg.Signal]](f=dlg.sig).connect(circuit, (program_3d,))
+        ext_dir_3d = Lift1[ZSet[dlg.Rule], ZSet[dlg.ExtendedDirection]](f=dlg.ext_dir).connect(circuit, (program_3d,))
+        jorder_3d = Lift1[ZSet[dlg.Rule], ZSet[tuple[str, dlg.ColumnReference]]](f=dlg.jorder).connect(circuit, (program_3d,))
+
+        # gatekeep: delayed_rewrites ⋈ ext_dir on provenance
+        indexed_rewrites = LiftIndex[dlg.ProvenanceIndexedRewrite, dlg.Provenance](indexer=lambda rw: rw[0]).connect(circuit, (delayed_rewrites,))
+        indexed_ext_dir = LiftIndex[dlg.ExtendedDirection, dlg.Provenance](indexer=lambda ed: ed[0]).connect(circuit, (ext_dir_3d,))
+        rewrite_idx_group = IndexedZSetAddition[dlg.Provenance, dlg.ProvenanceIndexedRewrite](self.rewrite_group, lambda rw: rw[0])
+        ext_dir_idx_group = IndexedZSetAddition[dlg.Provenance, dlg.ExtendedDirection](self.ext_dir_group, lambda ed: ed[0])
+        gatekeep = IndexedDeltaLiftedDeltaLiftedDeltaLiftedJoin[
+            dlg.Provenance, dlg.ProvenanceIndexedRewrite, dlg.ExtendedDirection, dlg.IndexedGatekeepEntry
+        ](
+            proj=lambda _k, l, r: (r[1], r[2], l[1], r[3]),
+            group_a=rewrite_idx_group, group_b=ext_dir_idx_group, out_group=self.gatekeep_group,
+        ).connect(circuit, (indexed_rewrites, indexed_ext_dir))
+
+        # facts ⋈ jorder on predicate → indexed (column-ref-keyed) facts
+        indexed_facts_by_pred = LiftIndex[dlg.Fact, str](indexer=lambda f: f[0]).connect(circuit, (delayed_facts,))
+        indexed_jorder_by_pred = LiftIndex[tuple[str, dlg.ColumnReference], str](indexer=lambda j: j[0]).connect(circuit, (jorder_3d,))
+        fact_pred_group = IndexedZSetAddition[str, dlg.Fact](self.fact_group, lambda f: f[0])
+        jorder_pred_group = IndexedZSetAddition[str, tuple[str, dlg.ColumnReference]](self.jorder_group, lambda j: j[0])
+        indexed_facts_raw = IndexedDeltaLiftedDeltaLiftedDeltaLiftedJoin[
+            str, dlg.Fact, tuple[str, dlg.ColumnReference], dlg.IndexedFact
+        ](
+            proj=lambda _k, fact, jo: dlg._index_fact(jo[1], fact),
+            group_a=fact_pred_group, group_b=jorder_pred_group, out_group=self.indexed_fact_group,
+        ).connect(circuit, (indexed_facts_by_pred, indexed_jorder_by_pred))
+        distinct_indexed_facts = DeltaLiftedDeltaLiftedDeltaLiftedDistinct[dlg.IndexedFact](
+            inner_group=self.indexed_fact_group
+        ).connect(circuit, (indexed_facts_raw,))
+
+        positive_atoms = Lift1[ZSet[dlg.IndexedGatekeepEntry], ZSet[dlg.IndexedGatekeepEntry]](
+            f=lambda z: ZSet({gk: w for gk, w in z.inner.items() if gk[1] is None or "!" not in gk[1][0]})
+        ).connect(circuit, (gatekeep,))
+        negative_atoms = Lift1[ZSet[dlg.IndexedGatekeepEntry], ZSet[dlg.IndexedGatekeepEntry]](
+            f=lambda z: ZSet({gk: w for gk, w in z.inner.items() if not (gk[1] is None or "!" not in gk[1][0])})
+        ).connect(circuit, (gatekeep,))
+
+        gatekeep_idx_group = IndexedZSetAddition[dlg.JoinKey, dlg.IndexedGatekeepEntry](self.gatekeep_group, dlg._gatekeep_join_key)
+        indexed_fact_idx_group = IndexedZSetAddition[dlg.JoinKey, dlg.IndexedFact](self.indexed_fact_group, lambda ifact: ifact[0])
+        keyed_positive = LiftIndex[dlg.IndexedGatekeepEntry, dlg.JoinKey](indexer=dlg._gatekeep_join_key).connect(circuit, (positive_atoms,))
+        keyed_facts = LiftIndex[dlg.IndexedFact, dlg.JoinKey](indexer=lambda ifact: ifact[0]).connect(circuit, (distinct_indexed_facts,))
+
+        product = IndexedDeltaLiftedDeltaLiftedDeltaLiftedJoin[
+            dlg.JoinKey, dlg.IndexedGatekeepEntry, dlg.IndexedFact, dlg.ProvenanceIndexedRewrite
+        ](
+            proj=dlg._indexed_product_proj,
+            group_a=gatekeep_idx_group, group_b=indexed_fact_idx_group, out_group=self.rewrite_group,
+        ).connect(circuit, (keyed_positive, keyed_facts))
+
+        proj = Lift1[ZSet[dlg.IndexedGatekeepEntry], ZSet[dlg.ProvenanceIndexedRewrite]](
+            f=lambda z: ZSet({(gk[0], gk[2]): w for gk, w in z.inner.items()})
+        ).connect(circuit, (negative_atoms,))
+
+        keyed_negative = LiftIndex[dlg.IndexedGatekeepEntry, dlg.JoinKey](indexer=dlg._gatekeep_join_key).connect(circuit, (negative_atoms,))
+        anti_product = IndexedDeltaLiftedDeltaLiftedDeltaLiftedJoin[
+            dlg.JoinKey, dlg.IndexedGatekeepEntry, dlg.IndexedFact, dlg.ProvenanceIndexedRewrite
+        ](
+            proj=lambda _k, gk, _ifact: (gk[0], gk[2]),
+            group_a=gatekeep_idx_group, group_b=indexed_fact_idx_group, out_group=self.rewrite_group,
+        ).connect(circuit, (keyed_negative, keyed_facts))
+
+        # final_product = product + proj − anti_product
+        product_plus_proj = Lift2[ZSet[dlg.ProvenanceIndexedRewrite], ZSet[dlg.ProvenanceIndexedRewrite], ZSet[dlg.ProvenanceIndexedRewrite]](
+            op=self.rewrite_group.add
+        ).connect(circuit, (product, proj))
+        neg_anti = Lift1[ZSet[dlg.ProvenanceIndexedRewrite], ZSet[dlg.ProvenanceIndexedRewrite]](f=self.rewrite_group.neg).connect(circuit, (anti_product,))
+        final_product = Lift2[ZSet[dlg.ProvenanceIndexedRewrite], ZSet[dlg.ProvenanceIndexedRewrite], ZSet[dlg.ProvenanceIndexedRewrite]](
+            op=self.rewrite_group.add
+        ).connect(circuit, (product_plus_proj, neg_anti))
+
+        # ground: final_product ⋈ sig on provenance → facts
+        indexed_final_product = LiftIndex[dlg.ProvenanceIndexedRewrite, dlg.Provenance](indexer=lambda r: r[0]).connect(circuit, (final_product,))
+        indexed_sig = LiftIndex[dlg.Signal, dlg.Provenance](indexer=lambda s: s[0]).connect(circuit, (sig_3d,))
+        sig_idx_group = IndexedZSetAddition[dlg.Provenance, dlg.Signal](self.signal_group, lambda s: s[0])
+        ground = IndexedDeltaLiftedDeltaLiftedDeltaLiftedJoin[dlg.Provenance, dlg.ProvenanceIndexedRewrite, dlg.Signal, dlg.Fact](
+            proj=lambda _k, l, r: l[1].apply(r[1]),
+            group_a=rewrite_idx_group, group_b=sig_idx_group, out_group=self.fact_group,
+        ).connect(circuit, (indexed_final_product, indexed_sig))
+
+        ground_plus_edb = Lift2[ZSet[dlg.Fact], ZSet[dlg.Fact], ZSet[dlg.Fact]](op=self.fact_group.add).connect(circuit, (ground, edb_3d))
+        next_facts = DeltaLiftedDeltaLiftedDeltaLiftedDistinct[dlg.Fact](inner_group=self.fact_group).connect(circuit, (ground_plus_edb,))
+
+        final_plus_seed = Lift2[ZSet[dlg.ProvenanceIndexedRewrite], ZSet[dlg.ProvenanceIndexedRewrite], ZSet[dlg.ProvenanceIndexedRewrite]](
+            op=self.rewrite_group.add
+        ).connect(circuit, (final_product, seed_3d))
+        next_rewrites = DeltaLiftedDeltaLiftedDeltaLiftedDistinct[dlg.ProvenanceIndexedRewrite](inner_group=self.rewrite_group).connect(circuit, (final_plus_seed,))
+
+        return Lift2[ZSet[dlg.Fact], ZSet[dlg.ProvenanceIndexedRewrite], tuple[ZSet[dlg.Fact], ZSet[dlg.ProvenanceIndexedRewrite]]](
+            op=lambda a, b: (a, b)
+        ).connect(circuit, (next_facts, next_rewrites))
+
+
 LevelAtLeast = tuple[str, int]
 """A ``(predicate, level)`` pair. ``level_at_least(P, k)`` semantics:
 P's stratum is *at least* k, derived from the dependency graph."""
@@ -756,7 +984,7 @@ def _connect_running_level_3d(
     )
 
 
-def _build_stratified_body_circuit() -> tuple[
+def _build_stratified_body_circuit(indexed: bool = False) -> tuple[
     Evaluator[Time],
     NodeId,  # edb_1d
     NodeId,  # program_1d (driver pushes raw rule deltas)
@@ -857,14 +1085,28 @@ def _build_stratified_body_circuit() -> tuple[
         group=rule_group,
     ).connect(e.circuit, (guarded_delta_si,))
 
-    body_out = IncrementalDatalogBodyWithNegation(
-        fact_group=fact_group,
-        rule_group=rule_group,
-        rewrite_group=rewrite_group,
-        signal_group=ZSetAddition[dlg.Signal](),
-        dir_group=ZSetAddition[dlg.Direction](),
-        gatekeep_group=(ZSetAddition[dlg.AtomWithSourceRewriteAndProvenance]()),
-    ).connect(
+    if indexed:
+        # SORT-MERGE-indexed body — identical IDB, asymptotically faster joins.
+        body = IndexedIncrementalDatalogBodyWithNegation(
+            fact_group=fact_group,
+            rule_group=rule_group,
+            rewrite_group=rewrite_group,
+            signal_group=ZSetAddition[dlg.Signal](),
+            ext_dir_group=ZSetAddition[dlg.ExtendedDirection](),
+            jorder_group=ZSetAddition[tuple[str, dlg.ColumnReference]](),
+            gatekeep_group=ZSetAddition[dlg.IndexedGatekeepEntry](),
+            indexed_fact_group=ZSetAddition[dlg.IndexedFact](),
+        )
+    else:
+        body = IncrementalDatalogBodyWithNegation(
+            fact_group=fact_group,
+            rule_group=rule_group,
+            rewrite_group=rewrite_group,
+            signal_group=ZSetAddition[dlg.Signal](),
+            dir_group=ZSetAddition[dlg.Direction](),
+            gatekeep_group=(ZSetAddition[dlg.AtomWithSourceRewriteAndProvenance]()),
+        )
+    body_out = body.connect(
         e.circuit,
         (
             edb_1d,
@@ -905,6 +1147,8 @@ class IncrementalDatalogStratified:
     incrementally, and the body circuit turns level changes into
     signed guarded-rule value changes rather than moving raw rules
     between timestamps."""
+
+    _indexed: bool = False  # subclasses flip this to use the sort-merge body
 
     def __init__(
         self,
@@ -963,7 +1207,7 @@ class IncrementalDatalogStratified:
             level_next,
             guarded_delta_3d,
             body_out,
-        ) = _build_stratified_body_circuit()
+        ) = _build_stratified_body_circuit(indexed=self._indexed)
         body_e.push(
             seed_1d,
             ZSet({(0, dlg._rewrite_monoid.identity()): 1}),
@@ -1105,3 +1349,71 @@ class IncrementalDatalogStratified:
             outer_delta,
         )
         return self._cumulative_facts
+
+
+class IndexedIncrementalDatalogStratified(IncrementalDatalogStratified):
+    """Drop-in for :class:`IncrementalDatalogStratified` whose body uses the
+    SORT-MERGE-indexed joins (:class:`IndexedIncrementalDatalogBodyWithNegation`).
+    Identical API, identical results — only the per-saturation join cost differs
+    (O(matching keys) vs O(|left|·|right|)), so it scales to large dense EDBs."""
+
+    _indexed = True
+
+
+class IndexedDatalogWithNegation:
+    """Single-batch 2-D (outer × inner) SORT-MERGE-indexed Datalog WITH NEGATION —
+    **no stratum axis**. Same ``push_rules`` / ``push_facts`` / ``saturate`` API as
+    :class:`IncrementalDatalogStratified`, but drives only the 2-D indexed negation
+    body (:class:`~pydbsp.indexed_relational_operators.IndexedIncrementalDatalogWithNegationBody`)
+    over a single outer tick to the inner fixpoint.
+
+    CORRECT for programs whose negation is a SINGLE stratum — every negated predicate
+    is computable independently of (never recursive through) the predicate that
+    negates it. For such programs the single 2-D fixpoint coincides with the
+    stratified semantics, and this is markedly faster than the 3-D stratified driver
+    (one fewer lattice axis + far less machinery). NOT a general stratified evaluator:
+    a genuine multi-stratum program (``c :- !b`` where ``b :- !a``) needs
+    :class:`IncrementalDatalogStratified`."""
+
+    def __init__(self, *, max_inner: int = 8192) -> None:
+        self._max_inner = max_inner
+        self._rule_group = ZSetAddition[dlg.Rule]()
+        self._fact_group = ZSetAddition[dlg.Fact]()
+        self._rules: ZSet[dlg.Rule] = ZSet({})
+        self._facts: ZSet[dlg.Fact] = ZSet({})
+
+    def push_rules(self, rules: ZSet[dlg.Rule]) -> None:
+        _check_stratifiable(self._rule_group.add(self._rules, rules))
+        self._rules = self._rule_group.add(self._rules, rules)
+
+    def push_facts(self, facts: ZSet[dlg.Fact]) -> None:
+        self._facts = self._fact_group.add(self._facts, facts)
+
+    def saturate(self) -> ZSet[dlg.Fact]:
+        fg, rug = self._fact_group, self._rule_group
+        rg = ZSetAddition[dlg.ProvenanceIndexedRewrite]()
+        e = Evaluator[Time](circuit=Circuit[Time](), storage=DictStorage(), ctx=ComputeCtx(lattice=dbsp_time(2)), group=fg)
+        edb_1d = Input[ZSet[dlg.Fact]](frontier=Antichain(dbsp_time(1))).connect(e.circuit, ())
+        program_1d = Input[ZSet[dlg.Rule]](frontier=Antichain(dbsp_time(1))).connect(e.circuit, ())
+        sf = Input[ZSet[dlg.Fact]](frontier=Antichain(dbsp_time(2))).connect(e.circuit, ())
+        sr = Input[ZSet[dlg.ProvenanceIndexedRewrite]](frontier=Antichain(dbsp_time(2))).connect(e.circuit, ())
+        seed = Input[ZSet[dlg.ProvenanceIndexedRewrite]](frontier=Antichain(dbsp_time(1))).connect(e.circuit, ())
+        program_2d = LiftStreamIntroduction[ZSet[dlg.Rule]](group=rug).connect(e.circuit, (program_1d,))
+        body = IndexedIncrementalDatalogWithNegationBody(
+            fact_group=fg, rule_group=rug, rewrite_group=rg, signal_group=ZSetAddition[dlg.Signal](),
+            ext_dir_group=ZSetAddition[dlg.ExtendedDirection](), jorder_group=ZSetAddition[tuple[str, dlg.ColumnReference]](),
+            gatekeep_group=ZSetAddition[dlg.IndexedGatekeepEntry](), indexed_fact_group=ZSetAddition[dlg.IndexedFact](),
+        ).connect(e.circuit, (edb_1d, program_2d, sf, sr, seed))
+        e.push(edb_1d, self._facts)
+        e.push(program_1d, self._rules)
+        e.push(seed, ZSet({(0, dlg._rewrite_monoid.identity()): 1}))
+        acc: dict[dlg.Fact, int] = {}
+        for k in range(self._max_inner):
+            diff_facts, diff_rewrites = e.read(body, (0, k))
+            if not diff_facts.inner and not diff_rewrites.inner:
+                break
+            for f, m in diff_facts.inner.items():
+                acc[f] = acc.get(f, 0) + m
+            e.push(sf, diff_facts, t=(0, k))
+            e.push(sr, diff_rewrites, t=(0, k))
+        return _without_internal_facts(ZSet({f: m for f, m in acc.items() if m != 0}))

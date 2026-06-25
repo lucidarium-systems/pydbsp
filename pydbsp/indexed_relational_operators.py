@@ -36,6 +36,8 @@ from pydbsp.zset import ZSet, ZSetAddition
 
 from pydbsp.circuit import Circuit
 from pydbsp.operator import (
+    CoreDelay,
+    CoreIntegrate,
     Delay,
     Differentiate,
     Integrate,
@@ -302,6 +304,69 @@ class IndexedDeltaLiftedDeltaLiftedJoin[K: _Comparable, A, B, C](Operator):
         sum_12 = Lift2[ZSet[C], ZSet[C], ZSet[C]](op=add).connect(circuit, (j1, j2))
         sum_34 = Lift2[ZSet[C], ZSet[C], ZSet[C]](op=add).connect(circuit, (j3, j4))
         return Lift2[ZSet[C], ZSet[C], ZSet[C]](op=add).connect(circuit, (sum_12, sum_34))
+
+
+@dataclass(frozen=True)
+class IndexedDeltaLiftedDeltaLiftedDeltaLiftedJoin[K: _Comparable, A, B, C](Operator):
+    """Indexed 8-term triply-incremental sort-merge join on a 3-axis lattice
+    (outer = axis 0, stratum = axis 1, inner = axis 2). The indexed analog of
+    :class:`pydbsp.datalog_stratified.DeltaLiftedDeltaLiftedDeltaLiftedJoin`:
+    identical subset-of-axes decomposition (``Δ³c = Σ_{Sₐ⊆{o,s,i}} J(z⁻¹^Sₐ I^Sₐ a,
+    I^complement b)``, 2³ = 8 terms), with the per-term value-level join replaced by
+    a :func:`sort_merge_join` over the shared key index — O(matching keys) per cell
+    instead of O(|left|·|right|).
+
+    Both operands are ``IndexedZSet[K, *]`` streams (typically ``LiftIndex`` output).
+    ``inputs = (diff_indexed_a, diff_indexed_b)``; ``proj(k, a, b) -> C | None``.
+    """
+
+    proj: Callable[[K, A, B], C | None]
+    group_a: IndexedZSetAddition[K, A]
+    group_b: IndexedZSetAddition[K, B]
+    out_group: ZSetAddition[C]
+
+    def connect(self, circuit: Circuit[Time], inputs: tuple[NodeId, ...]) -> NodeId:
+        if len(inputs) != 2:
+            raise ValueError(f"IndexedDeltaLiftedDeltaLiftedDeltaLiftedJoin takes 2 inputs; got {len(inputs)}")
+        diff_a, diff_b = inputs
+
+        # For every subset S ⊆ {0,1,2}: ``z⁻¹^S I^S diff_a`` (delayed) and ``I^S diff_b``.
+        a_paths: dict[frozenset[int], NodeId] = {frozenset(): diff_a}
+        b_paths: dict[frozenset[int], NodeId] = {frozenset(): diff_b}
+        for axis in (0, 1, 2):
+            new_a: dict[frozenset[int], NodeId] = {}
+            for subset, node in a_paths.items():
+                integrated = CoreIntegrate[IndexedZSet[K, A]](axis=axis, group=self.group_a).connect(circuit, (node,))
+                delayed = CoreDelay[IndexedZSet[K, A]](axis=axis, group=self.group_a).connect(circuit, (integrated,))
+                new_a[subset | {axis}] = delayed
+            a_paths.update(new_a)
+            new_b: dict[frozenset[int], NodeId] = {}
+            for subset, node in b_paths.items():
+                integrated = CoreIntegrate[IndexedZSet[K, B]](axis=axis, group=self.group_b).connect(circuit, (node,))
+                new_b[subset | {axis}] = integrated
+            b_paths.update(new_b)
+
+        # Inner term: sort-merge over the shared index (a single Lift2 — the lattice
+        # arity, not the lift depth, supplies the 3-D-ness; cf. LiftJoin == one Lift2).
+        proj = self.proj
+        term_op: Callable[[IndexedZSet[K, A], IndexedZSet[K, B]], ZSet[C]] = lambda la, lb: sort_merge_join(la, lb, proj)
+
+        def _join(left: NodeId, right: NodeId) -> NodeId:
+            return Lift2[IndexedZSet[K, A], IndexedZSet[K, B], ZSet[C]](op=term_op).connect(circuit, (left, right))
+
+        all_axes = frozenset({0, 1, 2})
+        terms = [
+            _join(a_paths[sa], b_paths[all_axes - sa])
+            for sa in (
+                frozenset(), frozenset({0}), frozenset({1}), frozenset({2}),
+                frozenset({0, 1}), frozenset({0, 2}), frozenset({1, 2}), frozenset({0, 1, 2}),
+            )
+        ]
+        add = self.out_group.add
+        result = terms[0]
+        for t in terms[1:]:
+            result = Lift2[ZSet[C], ZSet[C], ZSet[C]](op=add).connect(circuit, (result, t))
+        return result
 
 
 # ============================================================================

@@ -25,6 +25,7 @@ Originally split across ``pydbsp.algorithms.datalog`` and
 v2 layout, with the v1 evaluator/stream imports stripped.
 """
 
+from functools import total_ordering
 from typing import Any, NewType, TypeAlias, cast
 
 from pydbsp.zset import ZSet
@@ -46,6 +47,74 @@ def is_variable(term: object) -> bool:
     callers must construct Variables as ``Variable("?X")``, never as
     a bare ``"X"``."""
     return isinstance(term, str) and term.startswith("?")
+
+
+@total_ordering
+class Skolem:
+    """A term constructor for IDB value invention — a Skolem function symbol.
+
+    ``Skolem(functor, args)`` placed in a rule HEAD is grounded by
+    :meth:`Rewrite.apply`, which recursively substitutes the rule's body
+    bindings into ``args`` (each a Variable, Constant, or nested ``Skolem``).
+    The result is a deterministic compound *value*: a fresh identity that is a
+    pure function of its bound arguments. No gensym counter is needed, and
+    incremental maintenance stays exact — a change to the source bindings
+    retracts precisely the Skolem values keyed on them. This is what lets a
+    Datalog program *construct* trees (one invented node per source binding)
+    rather than only project existing facts.
+
+    A *ground* Skolem (no Variables left in ``args``) is an ordinary hashable
+    Constant: :func:`is_variable` returns False for it, so the unifier and the
+    indexed-join keys treat it as an opaque value and never destructure it.
+    Term construction therefore lives only in heads; a body consumes the
+    invented value through a Variable that binds to it.
+
+    Function symbols make Datalog Turing-complete, so a generative head inside
+    a recursive cycle can derive infinite terms. The stratification check
+    (``_check_stratifiable`` in :mod:`pydbsp.datalog_stratified`) rejects any
+    cyclic SCC that passes through a Skolem-bearing head, which guarantees
+    termination for the structural (acyclic-over-source) programs this targets.
+    """
+
+    __slots__ = ("functor", "args", "_hash")
+
+    def __init__(self, functor: Constant, args: tuple[Term, ...]) -> None:
+        self.functor = functor
+        self.args = tuple(args)
+        self._hash = None
+
+    def __eq__(self, other: object) -> bool:
+        return (
+            isinstance(other, Skolem)
+            and self.functor == other.functor
+            and self.args == other.args
+        )
+
+    def __hash__(self) -> int:
+        if self._hash is None:
+            self._hash = hash((Skolem, self.functor, self.args))
+        return self._hash
+
+    def __lt__(self, other: object) -> bool:
+        # A total, type-stable order so ground Skolems can live in the indexed
+        # sort-merge spines alongside ordinary constants (the ``_Comparable``
+        # contract). ``_order_key`` tags by type so heterogeneous terms never
+        # raise; Skolems sort after all plain constants.
+        return _order_key(self) < _order_key(other)
+
+    def __repr__(self) -> str:
+        return f"Skolem({self.functor!r}, {self.args!r})"
+
+
+def _order_key(term: object) -> tuple:
+    """Total ordering key for any Datalog term. Plain constants key as
+    ``(0, typename, value)`` — the typename string decides cross-type order
+    before any raw value comparison, so mixed-type terms never raise. Skolems
+    key as ``(1, functor_key, arg_keys)``, sorting after all plain constants
+    and recursing structurally."""
+    if type(term) is Skolem:
+        return (1, _order_key(term.functor), tuple(_order_key(a) for a in term.args))
+    return (0, type(term).__name__, term)
 
 
 Predicate: TypeAlias = str
@@ -96,13 +165,37 @@ class Rewrite:
             self._hash = hash(frozenset(self.inner.items()))
         return self._hash
 
+    def _ground_skolem(self, term: "Skolem") -> "Skolem":
+        """Substitute this rewrite into a Skolem constructor's args, recursing
+        into nested Skolems. The common var/constant cases stay inline so the
+        non-Skolem fast path in :meth:`apply` is untouched."""
+        inner = self.inner
+        return Skolem(
+            term.functor,
+            tuple(
+                inner.get(a, a)
+                if is_variable(a)
+                else self._ground_skolem(a)
+                if type(a) is Skolem
+                else a
+                for a in term.args
+            ),
+        )
+
     def apply(self, atom: Atom) -> Atom:
         inner = self.inner
         if not inner:
             return atom
         return (
             atom[0],
-            tuple(inner.get(t, t) if is_variable(t) else t for t in atom[1]),
+            tuple(
+                inner.get(t, t)
+                if is_variable(t)
+                else self._ground_skolem(t)
+                if type(t) is Skolem
+                else t
+                for t in atom[1]
+            ),
         )
 
 
