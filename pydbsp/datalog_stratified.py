@@ -892,6 +892,21 @@ def _max_inner_before_outer(
     return out
 
 
+def _max_inner_at_outer(frontier: Antichain[Time], outer: int) -> int:
+    """Largest inner coordinate covered by ``frontier`` at ``outer``, over ALL
+    middle-axis coordinates. The covering depth for reads of axis-2 integrals."""
+    if frontier.is_universal:
+        return -1
+    out = -1
+    for elt in frontier.elements:
+        if len(elt) < 3 or elt[0] != outer:
+            continue
+        inner = elt[2]
+        if isinstance(inner, int) and inner > out:
+            out = inner
+    return out
+
+
 def _connect_running_level_3d(
     e: Evaluator[Time],
     program_1d: NodeId,
@@ -1690,38 +1705,48 @@ class DatalogAlternating:
             dir_group=ZSetAddition[dlg.Direction](),
             gatekeep_group=ZSetAddition[dlg.AtomWithSourceRewriteAndProvenance](),
         ).connect(e.circuit, (edb_1d, program_3d, sf, sr, seed, neg_ref))
+
+        # Value plane, all in-circuit (elementary axis-generic operators on the
+        # body's facts output Δ³C): I² gives D⁰D¹C — at outer 0, the tick's model
+        # delta M_a − M_{a-1} (the alternation feedback value AND the convergence
+        # signal); I¹ of that gives D⁰C — the model itself.
+        facts_out = Lift1[
+            tuple[ZSet[dlg.Fact], ZSet[dlg.ProvenanceIndexedRewrite]],
+            ZSet[dlg.Fact],
+        ](f=lambda pair: pair[0]).connect(e.circuit, (body,))
+        tick_delta_node = CoreIntegrate[ZSet[dlg.Fact]](axis=2, group=fg).connect(e.circuit, (facts_out,))
+        model_node = CoreIntegrate[ZSet[dlg.Fact]](axis=1, group=fg).connect(e.circuit, (tick_delta_node,))
+
         e.push(edb_1d, self._facts)
         e.push(program_1d, self._rules)
         e.push(seed, ZSet({(0, dlg._rewrite_monoid.identity()): 1}))
 
-        model: dict[dlg.Fact, int] = {}
-        prev_depth = 0  # cross-tick join terms can fire at any inner i seen last tick
         for a in range(self._max_alternation):
-            tick_delta: dict[dlg.Fact, int] = {}
-            depth = 0
+            # Scan floor from the evaluator's OWN progress plane: cross-tick join
+            # terms (z⁻¹ on axis 1) can fire at any inner coordinate the previous
+            # tick reached, so scan at least as deep as the sf frontier covers.
+            floor = _max_inner_before_outer(e.frontiers()[sf], 1, a - 1) if a > 0 else -1
             i = 0
             while i < self._max_inner:
                 diff_facts, diff_rewrites = e.read(body, (0, a, i))
-                if not diff_facts.inner and not diff_rewrites.inner:
-                    if i >= prev_depth:
-                        break
-                else:
-                    depth = i + 1
-                for f, m in diff_facts.inner.items():
-                    tick_delta[f] = tick_delta.get(f, 0) + m
+                if not diff_facts.inner and not diff_rewrites.inner and i >= floor:
+                    break
                 e.push(sf, diff_facts, t=(0, a, i))
                 e.push(sr, diff_rewrites, t=(0, a, i))
                 i += 1
             else:
                 raise RuntimeError(f"alternation tick {a} did not converge in {self._max_inner} inner ticks")
-            if depth == 0:  # physically quiescent tick: zero delta at the fixpoint, stable forever
-                return _without_internal_facts(ZSet({f: m for f, m in model.items() if m != 0}))
-            for f, m in tick_delta.items():
-                model[f] = model.get(f, 0) + m
-            # the alternation feedback: the model's axis-1 delta, consumed at
+            tick_delta = e.read(tick_delta_node, (0, a, i))
+            if not tick_delta.inner:  # physically quiescent: zero delta at the fixpoint, stable forever
+                # cover the deepest inner cell ANY tick reached (earlier ticks may
+                # have derived, then retracted, deeper than the quiescent tick)
+                cov = max(i, _max_inner_at_outer(e.frontiers()[sf], 0))
+                return _without_internal_facts(e.read(model_node, (0, a, cov)))
+            # the alternation feedback edge: ferry the tick's model delta from the
+            # output port to the reference port (the driver-materialized ∫-barrier,
+            # same discipline as every pydbsp feedback edge); it is consumed at
             # tick a+1 through the in-circuit z⁻¹ on axis 1
-            e.push(neg_ref, ZSet({f: m for f, m in tick_delta.items() if m != 0}), t=(0, a, 0))
-            prev_depth = depth
+            e.push(neg_ref, tick_delta, t=(0, a, 0))
         raise RuntimeError(
             f"alternating fixpoint did not converge within {self._max_alternation} ticks "
             f"(non-total well-founded model? stratifiability is checked at push time)"
