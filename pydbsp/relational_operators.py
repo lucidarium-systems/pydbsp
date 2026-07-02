@@ -38,6 +38,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from pydbsp import datalog as dlg
 from pydbsp.zset import ZSet, ZSetAddition
 from pydbsp.zset.functions.bilinear import join
 from pydbsp.zset.functions.binary import H
@@ -52,6 +53,7 @@ from pydbsp.operator import (
     Lift2,
     LiftDelay,
     LiftIntegrate,
+    LiftStreamIntroduction,
     Operator,
 )
 from pydbsp.progress import NodeId, Time
@@ -273,3 +275,190 @@ class DeltaLiftedDeltaLiftedDistinct[V](Operator):
         # threshold-crossing function.
         h = LiftLiftH[V]().connect(circuit, (del_int_int, integrated))
         return Differentiate[ZSet[V]](group=self.inner_group).connect(circuit, (h,))
+
+
+@dataclass(frozen=True)
+class IncrementalDatalogWithNegationBody(Operator):
+    """Body of a negation-aware Datalog interpreter on the **2-D**
+    ``(outer, inner)`` lattice — the non-indexed counterpart of
+    :class:`pydbsp.indexed_relational_operators.IndexedIncrementalDatalogWithNegationBody`,
+    obtained by switching every indexed join to the plain
+    :class:`DeltaLiftedDeltaLiftedJoin` (with an explicit ``pred``) and
+    dropping every ``LiftIndex`` / ``ext_dir`` / ``jorder`` index step.
+    Equivalently, the 2-D reduction of the 3-D
+    :class:`pydbsp.datalog_stratified.IncrementalDatalogBodyWithNegation`.
+
+    Anti-rewrite bifurcation (C5 Def 4.8):
+    ``final_product = product + proj - anti_product + interp_proj`` — the
+    negated-atom rewrites survive iff their instantiated atom is ABSENT
+    from the facts (``proj`` minus ``anti_product``).
+
+    ``inputs = (edb_1d, program_2d, state_facts_2d, state_rewrites_2d,
+    seed_1d)``. Output at each ``(outer, inner)`` cell is the pair
+    ``(facts_diff, rewrites_diff)``."""
+
+    fact_group: ZSetAddition[dlg.Fact]
+    rule_group: ZSetAddition[dlg.Rule]
+    rewrite_group: ZSetAddition[dlg.ProvenanceIndexedRewrite]
+    signal_group: ZSetAddition[dlg.Signal]
+    dir_group: ZSetAddition[dlg.Direction]
+    gatekeep_group: ZSetAddition[dlg.AtomWithSourceRewriteAndProvenance]
+
+    def connect(
+        self,
+        circuit: Circuit[Time],
+        inputs: tuple[NodeId, ...],
+    ) -> NodeId:
+        if len(inputs) != 5:
+            raise ValueError(
+                f"IncrementalDatalogWithNegationBody takes 5 inputs "
+                f"(edb, program, state_facts, state_rewrites, seed); got {len(inputs)}"
+            )
+        edb_1d, program_2d, state_facts_2d, state_rewrites_2d, seed_1d = inputs
+
+        edb_2d = LiftStreamIntroduction[ZSet[dlg.Fact]](group=self.fact_group).connect(circuit, (edb_1d,))
+        seed_2d = LiftStreamIntroduction[ZSet[dlg.ProvenanceIndexedRewrite]](group=self.rewrite_group).connect(
+            circuit, (seed_1d,)
+        )
+
+        delayed_facts = LiftDelay[ZSet[dlg.Fact]](group=self.fact_group).connect(circuit, (state_facts_2d,))
+        delayed_rewrites = LiftDelay[ZSet[dlg.ProvenanceIndexedRewrite]](group=self.rewrite_group).connect(
+            circuit, (state_rewrites_2d,)
+        )
+
+        sig_2d = Lift1[ZSet[dlg.Rule], ZSet[dlg.Signal]](f=dlg.sig).connect(circuit, (program_2d,))
+        dir_2d = Lift1[ZSet[dlg.Rule], ZSet[dlg.Direction]](f=dlg.dir).connect(circuit, (program_2d,))
+
+        gatekeep = DeltaLiftedDeltaLiftedJoin[
+            dlg.ProvenanceIndexedRewrite,
+            dlg.Direction,
+            dlg.AtomWithSourceRewriteAndProvenance,
+        ](
+            pred=lambda left, right: left[0] == right[0],
+            proj=lambda left, right: (right[1], right[2], left[1]),
+            group_a=self.rewrite_group,
+            group_b=self.dir_group,
+            out_group=self.gatekeep_group,
+        ).connect(circuit, (delayed_rewrites, dir_2d))
+
+        positive_atoms = Lift1[
+            ZSet[dlg.AtomWithSourceRewriteAndProvenance],
+            ZSet[dlg.AtomWithSourceRewriteAndProvenance],
+        ](
+            f=lambda z: ZSet(
+                {
+                    gk: w
+                    for gk, w in z.inner.items()
+                    if gk[1] is None or ("!" not in gk[1][0] and gk[1][0] not in dlg.INTERPRETED)
+                }
+            ),
+        ).connect(circuit, (gatekeep,))
+        negative_atoms = Lift1[
+            ZSet[dlg.AtomWithSourceRewriteAndProvenance],
+            ZSet[dlg.AtomWithSourceRewriteAndProvenance],
+        ](
+            f=lambda z: ZSet({gk: w for gk, w in z.inner.items() if not (gk[1] is None or "!" not in gk[1][0])}),
+        ).connect(circuit, (gatekeep,))
+        interp_proj = Lift1[
+            ZSet[dlg.AtomWithSourceRewriteAndProvenance],
+            ZSet[dlg.ProvenanceIndexedRewrite],
+        ](
+            f=lambda z: ZSet(
+                {
+                    (gk[0], gk[2]): w
+                    for gk, w in z.inner.items()
+                    if gk[1] is not None and gk[1][0] in dlg.INTERPRETED and dlg.eval_interpreted(gk[1], gk[2])
+                }
+            ),
+        ).connect(circuit, (gatekeep,))
+
+        product = DeltaLiftedDeltaLiftedJoin[
+            dlg.AtomWithSourceRewriteAndProvenance,
+            dlg.Fact,
+            dlg.ProvenanceIndexedRewrite,
+        ](
+            pred=lambda left, right: (
+                left[1] is None or (left[1][0] == right[0] and dlg.unify(left[2].apply(left[1]), right) is not None)
+            ),
+            proj=dlg.rewrite_product_projection,
+            group_a=self.gatekeep_group,
+            group_b=self.fact_group,
+            out_group=self.rewrite_group,
+        ).connect(circuit, (positive_atoms, delayed_facts))
+
+        proj = Lift1[
+            ZSet[dlg.AtomWithSourceRewriteAndProvenance],
+            ZSet[dlg.ProvenanceIndexedRewrite],
+        ](
+            f=lambda z: ZSet({(gk[0], gk[2]): w for gk, w in z.inner.items()}),
+        ).connect(circuit, (negative_atoms,))
+
+        anti_product = DeltaLiftedDeltaLiftedJoin[
+            dlg.AtomWithSourceRewriteAndProvenance,
+            dlg.Fact,
+            dlg.ProvenanceIndexedRewrite,
+        ](
+            pred=lambda left, right: (
+                left[1] is None
+                or (left[1][0].strip("!") == right[0] and dlg.unify(left[2].apply(left[1]), right) is not None)
+            ),
+            proj=lambda left, _right: (left[0], left[2]),
+            group_a=self.gatekeep_group,
+            group_b=self.fact_group,
+            out_group=self.rewrite_group,
+        ).connect(circuit, (negative_atoms, delayed_facts))
+
+        # final_product = product + proj - anti_product + interp_proj
+        product_plus_proj = Lift2[
+            ZSet[dlg.ProvenanceIndexedRewrite],
+            ZSet[dlg.ProvenanceIndexedRewrite],
+            ZSet[dlg.ProvenanceIndexedRewrite],
+        ](op=self.rewrite_group.add).connect(circuit, (product, proj))
+        neg_anti = Lift1[
+            ZSet[dlg.ProvenanceIndexedRewrite],
+            ZSet[dlg.ProvenanceIndexedRewrite],
+        ](f=self.rewrite_group.neg).connect(circuit, (anti_product,))
+        final_product_neg = Lift2[
+            ZSet[dlg.ProvenanceIndexedRewrite],
+            ZSet[dlg.ProvenanceIndexedRewrite],
+            ZSet[dlg.ProvenanceIndexedRewrite],
+        ](op=self.rewrite_group.add).connect(circuit, (product_plus_proj, neg_anti))
+        final_product = Lift2[
+            ZSet[dlg.ProvenanceIndexedRewrite],
+            ZSet[dlg.ProvenanceIndexedRewrite],
+            ZSet[dlg.ProvenanceIndexedRewrite],
+        ](op=self.rewrite_group.add).connect(circuit, (final_product_neg, interp_proj))
+
+        ground = DeltaLiftedDeltaLiftedJoin[
+            dlg.ProvenanceIndexedRewrite,
+            dlg.Signal,
+            dlg.Fact,
+        ](
+            pred=lambda left, right: left[0] == right[0],
+            proj=lambda left, right: left[1].apply(right[1]),
+            group_a=self.rewrite_group,
+            group_b=self.signal_group,
+            out_group=self.fact_group,
+        ).connect(circuit, (final_product, sig_2d))
+
+        ground_plus_edb = Lift2[ZSet[dlg.Fact], ZSet[dlg.Fact], ZSet[dlg.Fact]](op=self.fact_group.add).connect(
+            circuit, (ground, edb_2d)
+        )
+        next_facts = DeltaLiftedDeltaLiftedDistinct[dlg.Fact](inner_group=self.fact_group).connect(
+            circuit, (ground_plus_edb,)
+        )
+
+        final_plus_seed = Lift2[
+            ZSet[dlg.ProvenanceIndexedRewrite],
+            ZSet[dlg.ProvenanceIndexedRewrite],
+            ZSet[dlg.ProvenanceIndexedRewrite],
+        ](op=self.rewrite_group.add).connect(circuit, (final_product, seed_2d))
+        next_rewrites = DeltaLiftedDeltaLiftedDistinct[dlg.ProvenanceIndexedRewrite](
+            inner_group=self.rewrite_group
+        ).connect(circuit, (final_plus_seed,))
+
+        return Lift2[
+            ZSet[dlg.Fact],
+            ZSet[dlg.ProvenanceIndexedRewrite],
+            tuple[ZSet[dlg.Fact], ZSet[dlg.ProvenanceIndexedRewrite]],
+        ](op=lambda a, b: (a, b)).connect(circuit, (next_facts, next_rewrites))

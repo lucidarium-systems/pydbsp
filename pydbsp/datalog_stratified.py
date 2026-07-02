@@ -50,7 +50,7 @@ from pydbsp.operator import (
     Operator,
 )
 from pydbsp.progress import NodeId, Time
-from pydbsp.relational_operators import LiftH, LiftJoin
+from pydbsp.relational_operators import IncrementalDatalogWithNegationBody, LiftH, LiftJoin
 from pydbsp.storage import DictStorage
 from pydbsp.zset import ZSet, ZSetAddition
 
@@ -1449,6 +1449,60 @@ class IndexedDatalogWithNegation:
             fact_group=fg, rule_group=rug, rewrite_group=rg, signal_group=ZSetAddition[dlg.Signal](),
             ext_dir_group=ZSetAddition[dlg.ExtendedDirection](), jorder_group=ZSetAddition[tuple[str, dlg.ColumnReference]](),
             gatekeep_group=ZSetAddition[dlg.IndexedGatekeepEntry](), indexed_fact_group=ZSetAddition[dlg.IndexedFact](),
+        ).connect(e.circuit, (edb_1d, program_2d, sf, sr, seed))
+        e.push(edb_1d, self._facts)
+        e.push(program_1d, self._rules)
+        e.push(seed, ZSet({(0, dlg._rewrite_monoid.identity()): 1}))
+        acc: dict[dlg.Fact, int] = {}
+        for k in range(self._max_inner):
+            diff_facts, diff_rewrites = e.read(body, (0, k))
+            if not diff_facts.inner and not diff_rewrites.inner:
+                break
+            for f, m in diff_facts.inner.items():
+                acc[f] = acc.get(f, 0) + m
+            e.push(sf, diff_facts, t=(0, k))
+            e.push(sr, diff_rewrites, t=(0, k))
+        return _without_internal_facts(ZSet({f: m for f, m in acc.items() if m != 0}))
+
+
+class DatalogWithNegation:
+    """Single-batch 2-D (outer × inner) NON-INDEXED Datalog WITH NEGATION — the
+    non-indexed counterpart of :class:`IndexedDatalogWithNegation`, driving the plain
+    :class:`~pydbsp.relational_operators.IncrementalDatalogWithNegationBody` (``pred``-based
+    joins, no sort-merge index). Same ``push_rules`` / ``push_facts`` / ``saturate`` API and
+    the same single-stratum-negation correctness domain; slower (O(n²) joins) but index-free.
+    Used to validate the non-indexed body against the indexed one."""
+
+    def __init__(self, *, max_inner: int = 8192) -> None:
+        self._max_inner = max_inner
+        self._rule_group = ZSetAddition[dlg.Rule]()
+        self._fact_group = ZSetAddition[dlg.Fact]()
+        self._rules: ZSet[dlg.Rule] = ZSet({})
+        self._facts: ZSet[dlg.Fact] = ZSet({})
+
+    def push_rules(self, rules: ZSet[dlg.Rule]) -> None:
+        merged = self._rule_group.add(self._rules, rules)
+        _check_stratifiable(merged)
+        dlg.check_interpreted_safety(merged)
+        self._rules = merged
+
+    def push_facts(self, facts: ZSet[dlg.Fact]) -> None:
+        self._facts = self._fact_group.add(self._facts, facts)
+
+    def saturate(self) -> ZSet[dlg.Fact]:
+        fg, rug = self._fact_group, self._rule_group
+        rg = ZSetAddition[dlg.ProvenanceIndexedRewrite]()
+        e = Evaluator[Time](circuit=Circuit[Time](), storage=DictStorage(), ctx=ComputeCtx(lattice=dbsp_time(2)), group=fg)
+        edb_1d = Input[ZSet[dlg.Fact]](frontier=Antichain(dbsp_time(1))).connect(e.circuit, ())
+        program_1d = Input[ZSet[dlg.Rule]](frontier=Antichain(dbsp_time(1))).connect(e.circuit, ())
+        sf = Input[ZSet[dlg.Fact]](frontier=Antichain(dbsp_time(2))).connect(e.circuit, ())
+        sr = Input[ZSet[dlg.ProvenanceIndexedRewrite]](frontier=Antichain(dbsp_time(2))).connect(e.circuit, ())
+        seed = Input[ZSet[dlg.ProvenanceIndexedRewrite]](frontier=Antichain(dbsp_time(1))).connect(e.circuit, ())
+        program_2d = LiftStreamIntroduction[ZSet[dlg.Rule]](group=rug).connect(e.circuit, (program_1d,))
+        body = IncrementalDatalogWithNegationBody(
+            fact_group=fg, rule_group=rug, rewrite_group=rg, signal_group=ZSetAddition[dlg.Signal](),
+            dir_group=ZSetAddition[dlg.Direction](),
+            gatekeep_group=ZSetAddition[dlg.AtomWithSourceRewriteAndProvenance](),
         ).connect(e.circuit, (edb_1d, program_2d, sf, sr, seed))
         e.push(edb_1d, self._facts)
         e.push(program_1d, self._rules)
