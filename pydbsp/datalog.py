@@ -311,6 +311,13 @@ def check_interpreted_safety(program: "ZSet[Rule]") -> None:
 
 
 def sig(program: Program) -> GroundingSignals:
+    # ACCUMULATE shared keys: sig must be LINEAR in the program Z-set — it is
+    # applied to DELTA cells by Lift1, so sig(P + ΔP) = sig(P) + sig(ΔP) is
+    # load-bearing (the Lean model proves this as `sigFunc.linear_ok`). Dict
+    # ASSIGNMENT here silently under-counted shared keys (rules with permuted
+    # bodies and the same head share the running total); single-batch runs
+    # never notice (distinct clamps multiplicity), but rule DELETION of one
+    # sharer then annihilates the survivors' signal.
     signals: dict[Signal, int] = {}
     for rule, weight in program.inner.items():
         if weight == 0:
@@ -319,11 +326,17 @@ def sig(program: Program) -> GroundingSignals:
         if len(rule) > 1:
             for dep in rule[1:]:
                 running += hash(dep)
-        signals[(running, rule[0])] = weight
-    return ZSet(signals)
+        key = (running, rule[0])
+        signals[key] = signals.get(key, 0) + weight
+    return ZSet({k: w for k, w in signals.items() if w != 0})
 
 
 def dir(program: Program) -> ProvenanceChain:
+    # ACCUMULATE shared keys: the provenance chain deliberately shares rewrite
+    # prefixes across rules (running atom-hash, no rule id), so distinct rules
+    # ROUTINELY contribute the same direction. Linearity (`dirFunc.linear_ok`
+    # in the Lean model) requires the weights to ADD; see sig() for the
+    # rule-deletion failure mode of the old dict-assignment version.
     directions: dict[Direction, int] = {}
     for rule, weight in program.inner.items():
         if weight == 0:
@@ -333,8 +346,9 @@ def dir(program: Program) -> ProvenanceChain:
             for dep in rule[1:]:
                 prev = running
                 running += hash(dep)
-                directions[(prev, running, dep)] = weight
-    return ZSet(directions)
+                key = (prev, running, dep)
+                directions[key] = directions.get(key, 0) + weight
+    return ZSet({k: w for k, w in directions.items() if w != 0})
 
 
 def rewrite_product_projection(
@@ -391,7 +405,8 @@ def _rule_col_refs(rule: Rule) -> list[tuple[Atom, ColumnReference]]:
 
 
 def ext_dir(program: Program) -> ExtendedProvenanceChain:
-    """Direction chain with per-body-atom ``col_ref`` attached."""
+    """Direction chain with per-body-atom ``col_ref`` attached. ACCUMULATES
+    shared keys — same linearity requirement as :func:`dir`."""
     entries: dict[ExtendedDirection, int] = {}
     for rule, weight in program.inner.items():
         if weight == 0:
@@ -400,8 +415,9 @@ def ext_dir(program: Program) -> ExtendedProvenanceChain:
         for body_atom, col_ref in _rule_col_refs(rule):
             prev = running
             running += hash(body_atom)
-            entries[(prev, running, body_atom, col_ref)] = weight
-    return ZSet(entries)
+            key = (prev, running, body_atom, col_ref)
+            entries[key] = entries.get(key, 0) + weight
+    return ZSet({k: w for k, w in entries.items() if w != 0})
 
 
 def jorder(program: Program) -> ZSet[tuple[str, ColumnReference]]:

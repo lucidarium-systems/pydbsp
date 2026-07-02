@@ -892,18 +892,18 @@ def _max_inner_before_outer(
     return out
 
 
-def _max_inner_at_outer(frontier: Antichain[Time], outer: int) -> int:
-    """Largest inner coordinate covered by ``frontier`` at ``outer``, over ALL
-    middle-axis coordinates. The covering depth for reads of axis-2 integrals."""
+def _frontier_max(frontier: Antichain[Time], axis: int) -> int:
+    """Largest coordinate on ``axis`` covered anywhere by ``frontier``'s
+    down-set (= the max over its maximal elements)."""
     if frontier.is_universal:
         return -1
     out = -1
     for elt in frontier.elements:
-        if len(elt) < 3 or elt[0] != outer:
+        if len(elt) < 3:
             continue
-        inner = elt[2]
-        if isinstance(inner, int) and inner > out:
-            out = inner
+        v = elt[axis]
+        if isinstance(v, int) and v > out:
+            out = v
     return out
 
 
@@ -1721,33 +1721,211 @@ class DatalogAlternating:
         e.push(program_1d, self._rules)
         e.push(seed, ZSet({(0, dlg._rewrite_monoid.identity()): 1}))
 
+        # Scan bounds from the Δ³-support rule: output deltas live in the
+        # ∨-closure of pushed cells, shifted ONCE per explicit entry delay —
+        # sf/sr enter the body only through z⁻¹ on axis 2 (+1 inner), neg_ref
+        # only through z⁻¹ on axis 1 (+1 tick), δ₀ imports at coordinate 0.
+        # The bounds read the LIVE input antichains (pushes advance them), so
+        # cascade, cross-tick holes and cross-outer joins need no special cases.
+        sf_ac = e.circuit.progress_rules[sf].frontier
+        sr_ac = e.circuit.progress_rules[sr].frontier
+        nr_ac = e.circuit.progress_rules[neg_ref].frontier
+
+        def inner_bound() -> int:
+            return 1 + max(_frontier_max(sf_ac, 2), _frontier_max(sr_ac, 2))
+
+        def alt_bound() -> int:
+            return max(
+                _frontier_max(sf_ac, 1), _frontier_max(sr_ac, 1), 1 + _frontier_max(nr_ac, 1)
+            )
+
         for a in range(self._max_alternation):
-            # Scan floor from the evaluator's OWN progress plane: cross-tick join
-            # terms (z⁻¹ on axis 1) can fire at any inner coordinate the previous
-            # tick reached, so scan at least as deep as the sf frontier covers.
-            floor = _max_inner_before_outer(e.frontiers()[sf], 1, a - 1) if a > 0 else -1
+            quiet = True
             i = 0
             while i < self._max_inner:
                 diff_facts, diff_rewrites = e.read(body, (0, a, i))
-                if not diff_facts.inner and not diff_rewrites.inner and i >= floor:
-                    break
-                e.push(sf, diff_facts, t=(0, a, i))
-                e.push(sr, diff_rewrites, t=(0, a, i))
+                if not diff_facts.inner and not diff_rewrites.inner:
+                    if i > inner_bound():
+                        break
+                else:
+                    quiet = False
+                    if diff_facts.inner:
+                        e.push(sf, diff_facts, t=(0, a, i))
+                    if diff_rewrites.inner:
+                        e.push(sr, diff_rewrites, t=(0, a, i))
                 i += 1
             else:
                 raise RuntimeError(f"alternation tick {a} did not converge in {self._max_inner} inner ticks")
             tick_delta = e.read(tick_delta_node, (0, a, i))
-            if not tick_delta.inner:  # physically quiescent: zero delta at the fixpoint, stable forever
-                # cover the deepest inner cell ANY tick reached (earlier ticks may
-                # have derived, then retracted, deeper than the quiescent tick)
-                cov = max(i, _max_inner_at_outer(e.frontiers()[sf], 0))
-                return _without_internal_facts(e.read(model_node, (0, a, cov)))
-            # the alternation feedback edge: ferry the tick's model delta from the
-            # output port to the reference port (the driver-materialized ∫-barrier,
-            # same discipline as every pydbsp feedback edge); it is consumed at
-            # tick a+1 through the in-circuit z⁻¹ on axis 1
-            e.push(neg_ref, tick_delta, t=(0, a, 0))
+            if tick_delta.inner:
+                # the alternation feedback edge: ferry the tick's model delta from
+                # the output port to the reference port (the driver-materialized
+                # ∫-barrier); consumed at tick a+1 through the in-circuit z⁻¹ on axis 1
+                e.push(neg_ref, tick_delta, t=(0, a, 0))
+            if quiet and a >= alt_bound():  # all support sites visited and zero: stable forever
+                return _without_internal_facts(e.read(model_node, (0, a, inner_bound())))
         raise RuntimeError(
             f"alternating fixpoint did not converge within {self._max_alternation} ticks "
             f"(non-total well-founded model? stratifiability is checked at push time)"
         )
+
+
+class IncrementalDatalogAlternating:
+    """MULTI-BATCH (t1-incremental) driver for the alternating-fixpoint 3-D
+    circuit — the same circuit as :class:`DatalogAlternating` (every operator
+    is already the Δ³ form, so incrementality on all three axes is a property
+    of the circuit; this class only supplies the persistent multi-batch crank).
+
+    Protocol = three nested fixpoints: each ``saturate()`` call advances ONE
+    outer tick (pending fact/rule deltas are pushed at ``(t1,)``), walks the
+    alternation axis to quiescence, and walks the inner axis to quiescence per
+    alternation tick. The restart is positional, not computational: cell
+    ``(t1+1, a, i)`` evaluates to the DELTA against ``(t1, a, i)`` through the
+    operators' internal integrals, so undisturbed cells read zero and the work
+    is proportional to the delta cone. Retractions (negative-weight fact or
+    RULE deltas) ride the same path; because no stratification is ever
+    computed, rule updates that change the stratum structure need zero
+    special-casing — the alternation simply re-converges.
+
+    Scan floors come from the evaluator's Antichain progress plane, on BOTH
+    axes: work sites at ``(t1, a, i)`` are seeded by ``z⁻¹`` shifts from the
+    prior alternation tick (same outer), the prior outer (same and prior
+    tick), and the inner cascade — so the inner scan floor is the max of the
+    two frontier reads, and the ALTERNATION axis gets the symmetric treatment
+    (a batch delta touching only high strata reads zero at low ticks and fires
+    deeper: alternation-axis holes, the inner-hole physics one axis up).
+    Alternation quiescence = zero ticks through the prior batch's alternation
+    depth; by that floor, every cell past the quiescent tick is provably zero,
+    so the cumulative-model read (the ``I⁰`` tap) at the covering coordinates
+    is exact.
+
+    ``push_rules`` validates stratifiability of the CUMULATIVE program
+    (hypothesis, not mechanism). ``compact_each_tick=True`` runs
+    :meth:`Evaluator.compact` after each outer tick's model read (GC)."""
+
+    def __init__(
+        self,
+        *,
+        max_inner: int = 8192,
+        max_alternation: int = 64,
+        compact_each_tick: bool = False,
+    ) -> None:
+        self._max_inner = max_inner
+        self._max_alternation = max_alternation
+        self._compact_each_tick = compact_each_tick
+        self._rule_group = ZSetAddition[dlg.Rule]()
+        self._fact_group = ZSetAddition[dlg.Fact]()
+        self._all_rules: ZSet[dlg.Rule] = ZSet({})
+        self._pending_rules: ZSet[dlg.Rule] = ZSet({})
+        self._pending_edb: ZSet[dlg.Fact] = ZSet({})
+        self._next_outer = 0
+        self._e: Evaluator[Time] | None = None
+
+    def push_rules(self, rules: ZSet[dlg.Rule]) -> None:
+        merged = self._rule_group.add(self._all_rules, rules)
+        _check_stratifiable(merged)  # on the cumulative program; commit only if it holds
+        dlg.check_interpreted_safety(merged)
+        self._all_rules = merged
+        self._pending_rules = self._rule_group.add(self._pending_rules, rules)
+
+    def push_facts(self, facts: ZSet[dlg.Fact]) -> None:
+        self._pending_edb = self._fact_group.add(self._pending_edb, facts)
+
+    def _setup_circuits(self) -> None:
+        fg, rug = self._fact_group, self._rule_group
+        rg = ZSetAddition[dlg.ProvenanceIndexedRewrite]()
+        e = Evaluator[Time](
+            circuit=Circuit[Time](), storage=DictStorage(), ctx=ComputeCtx(lattice=dbsp_time(3)), group=fg
+        )
+        self._edb_1d = Input[ZSet[dlg.Fact]](frontier=Antichain(dbsp_time(1))).connect(e.circuit, ())
+        self._program_1d = Input[ZSet[dlg.Rule]](frontier=Antichain(dbsp_time(1))).connect(e.circuit, ())
+        self._sf = Input[ZSet[dlg.Fact]](frontier=Antichain(dbsp_time(3))).connect(e.circuit, ())
+        self._sr = Input[ZSet[dlg.ProvenanceIndexedRewrite]](frontier=Antichain(dbsp_time(3))).connect(e.circuit, ())
+        self._neg_ref = Input[ZSet[dlg.Fact]](frontier=Antichain(dbsp_time(3))).connect(e.circuit, ())
+        seed = Input[ZSet[dlg.ProvenanceIndexedRewrite]](frontier=Antichain(dbsp_time(1))).connect(e.circuit, ())
+        program_2d = LiftStreamIntroduction[ZSet[dlg.Rule]](group=rug).connect(e.circuit, (self._program_1d,))
+        program_3d = LiftStreamIntroduction[ZSet[dlg.Rule]](group=rug).connect(e.circuit, (program_2d,))
+        self._body = IncrementalDatalogBodyWithNegation(
+            fact_group=fg, rule_group=rug, rewrite_group=rg, signal_group=ZSetAddition[dlg.Signal](),
+            dir_group=ZSetAddition[dlg.Direction](),
+            gatekeep_group=ZSetAddition[dlg.AtomWithSourceRewriteAndProvenance](),
+        ).connect(e.circuit, (self._edb_1d, program_3d, self._sf, self._sr, seed, self._neg_ref))
+        facts_out = Lift1[
+            tuple[ZSet[dlg.Fact], ZSet[dlg.ProvenanceIndexedRewrite]],
+            ZSet[dlg.Fact],
+        ](f=lambda pair: pair[0]).connect(e.circuit, (self._body,))
+        # I² = the outer-delta of the tick delta (the neg_ref feed at every outer);
+        # I¹ of that = the outer-delta of the model; I⁰ of that = the model.
+        self._tick_delta_node = CoreIntegrate[ZSet[dlg.Fact]](axis=2, group=fg).connect(e.circuit, (facts_out,))
+        model_delta_node = CoreIntegrate[ZSet[dlg.Fact]](axis=1, group=fg).connect(e.circuit, (self._tick_delta_node,))
+        self._cum_model_node = CoreIntegrate[ZSet[dlg.Fact]](axis=0, group=fg).connect(e.circuit, (model_delta_node,))
+        e.push(seed, ZSet({(0, dlg._rewrite_monoid.identity()): 1}), t=(0,))
+        self._e = e
+
+    def saturate(self) -> ZSet[dlg.Fact]:
+        if self._e is None:
+            self._setup_circuits()
+        e = self._e
+        assert e is not None
+        rule_delta, self._pending_rules = self._pending_rules, ZSet({})
+        edb_delta, self._pending_edb = self._pending_edb, ZSet({})
+        t1 = self._next_outer
+        self._next_outer += 1
+        if rule_delta.inner:
+            e.push(self._program_1d, rule_delta, t=(t1,))
+        if edb_delta.inner:
+            e.push(self._edb_1d, edb_delta, t=(t1,))
+
+        # Scan bounds from the Δ³-support rule: output deltas live in the
+        # ∨-closure of pushed cells, shifted ONCE per explicit entry delay
+        # (sf/sr enter via z⁻¹ on axis 2, neg_ref via z⁻¹ on axis 1; δ₀ imports
+        # sit at coordinate 0). Lattice joins lift any HISTORICAL cell to the
+        # current outer, so the bounds are global frontier maxima — read live
+        # from the input antichains, which grow as the scan pushes.
+        sf_ac = e.circuit.progress_rules[self._sf].frontier
+        sr_ac = e.circuit.progress_rules[self._sr].frontier
+        nr_ac = e.circuit.progress_rules[self._neg_ref].frontier
+
+        def inner_bound() -> int:
+            return 1 + max(_frontier_max(sf_ac, 2), _frontier_max(sr_ac, 2))
+
+        def alt_bound() -> int:
+            return max(
+                _frontier_max(sf_ac, 1), _frontier_max(sr_ac, 1), 1 + _frontier_max(nr_ac, 1)
+            )
+
+        a = 0
+        while a < self._max_alternation:
+            quiet = True
+            i = 0
+            while i < self._max_inner:
+                diff_facts, diff_rewrites = e.read(self._body, (t1, a, i))
+                if not diff_facts.inner and not diff_rewrites.inner:
+                    if i > inner_bound():
+                        break
+                else:
+                    quiet = False
+                    if diff_facts.inner:
+                        e.push(self._sf, diff_facts, t=(t1, a, i))
+                    if diff_rewrites.inner:
+                        e.push(self._sr, diff_rewrites, t=(t1, a, i))
+                i += 1
+            else:
+                raise RuntimeError(
+                    f"outer {t1} alternation tick {a} did not converge in {self._max_inner} inner ticks"
+                )
+            tick_delta = e.read(self._tick_delta_node, (t1, a, i))
+            if tick_delta.inner:
+                e.push(self._neg_ref, tick_delta, t=(t1, a, 0))
+            if quiet and a >= alt_bound():  # all support sites visited and zero
+                break
+            a += 1
+        else:
+            raise RuntimeError(
+                f"outer {t1}: alternating fixpoint did not converge within "
+                f"{self._max_alternation} ticks (non-total well-founded model?)"
+            )
+        model = e.read(self._cum_model_node, (t1, max(a, alt_bound()), inner_bound()))
+        if self._compact_each_tick:
+            e.compact()
+        return _without_internal_facts(model)
