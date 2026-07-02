@@ -516,7 +516,19 @@ class IncrementalDatalogBodyWithNegation(Operator):
 
     Output is a single ``NodeId`` whose value at each
     ``(outer, stratum, inner)`` cell is the pair ``(facts_diff,
-    rewrites_diff)``."""
+    rewrites_diff)``.
+
+    SPLIT NEGATION PORT (optional 6th input ``neg_ref_3d``): when given,
+    the negation test (``anti_product``) reads THIS input through a
+    genuine ``z⁻¹`` on the MIDDLE axis (``CoreDelay(axis=1)``) instead of
+    the moving axis-2-delayed facts state. The reference is therefore (a)
+    one alternation tick old and (b) FROZEN along the inner axis (nothing
+    is pushed at inner coordinates > 0; the anti-join's internal
+    integrals hold it constant). This is the uniformly-lifted
+    semipositive circuit of the alternating-fixpoint evaluator
+    (:class:`DatalogAlternating`): the middle axis is the alternation
+    axis, and the ONLY new operator relative to the mechanical lift is
+    this single delay edge. With 5 inputs, behavior is unchanged."""
 
     fact_group: ZSetAddition[dlg.Fact]
     rule_group: ZSetAddition[dlg.Rule]
@@ -530,13 +542,14 @@ class IncrementalDatalogBodyWithNegation(Operator):
         circuit: Circuit[Time],
         inputs: tuple[NodeId, ...],
     ) -> NodeId:
-        if len(inputs) != 5:
+        if len(inputs) not in (5, 6):
             raise ValueError(
                 f"IncrementalDatalogBodyWithNegation takes 5 inputs "
-                f"(edb, program, state_facts, state_rewrites, seed); "
-                f"got {len(inputs)}"
+                f"(edb, program, state_facts, state_rewrites, seed) or 6 "
+                f"(…, neg_ref); got {len(inputs)}"
             )
-        edb_1d, program_3d, state_facts_3d, state_rewrites_3d, seed_1d = inputs
+        edb_1d, program_3d, state_facts_3d, state_rewrites_3d, seed_1d = inputs[:5]
+        neg_ref_3d = inputs[5] if len(inputs) == 6 else None
 
         edb_2d_step = LiftStreamIntroduction[ZSet[dlg.Fact]](group=self.fact_group).connect(circuit, (edb_1d,))
         edb_3d = LiftStreamIntroduction[ZSet[dlg.Fact]](group=self.fact_group).connect(circuit, (edb_2d_step,))
@@ -550,6 +563,14 @@ class IncrementalDatalogBodyWithNegation(Operator):
         delayed_facts = CoreDelay[ZSet[dlg.Fact]](axis=2, group=self.fact_group).connect(circuit, (state_facts_3d,))
         delayed_rewrites = CoreDelay[ZSet[dlg.ProvenanceIndexedRewrite]](axis=2, group=self.rewrite_group).connect(
             circuit, (state_rewrites_3d,)
+        )
+
+        # Negation reference: with the split port, a real z⁻¹ on the ALTERNATION
+        # axis — the one new operator of the alternating-fixpoint circuit.
+        neg_ref_wire = (
+            CoreDelay[ZSet[dlg.Fact]](axis=1, group=self.fact_group).connect(circuit, (neg_ref_3d,))
+            if neg_ref_3d is not None
+            else delayed_facts
         )
 
         sig_3d = Lift1[ZSet[dlg.Rule], ZSet[dlg.Signal]](f=dlg.sig).connect(circuit, (program_3d,))
@@ -635,7 +656,7 @@ class IncrementalDatalogBodyWithNegation(Operator):
             group_a=self.gatekeep_group,
             group_b=self.fact_group,
             out_group=self.rewrite_group,
-        ).connect(circuit, (negative_atoms, delayed_facts))
+        ).connect(circuit, (negative_atoms, neg_ref_wire))
 
         # final_product = product + proj − anti_product
         product_plus_proj = Lift2[
@@ -1596,3 +1617,112 @@ class DatalogStratifiedComposition:
             stage.push_facts(facts)  # E ∪ F(s-1): lower strata are this stage's EDB
             facts = stage.saturate()
         return facts
+
+
+class DatalogAlternating:
+    """Stratified-negation evaluation as the ALTERNATING FIXPOINT (Van Gelder)
+    of the semipositive circuit, as ONE physical 3-D circuit on the
+    ``(outer, alternation, inner)`` lattice (``dbsp_time(3)``):
+
+    * the body is the uniformly-lifted semipositive negation body
+      (:class:`IncrementalDatalogBodyWithNegation` — 8-term joins, 3-D
+      distinct), with its split negation-reference port;
+    * the ONLY new operator is the alternation feedback edge: the model's
+      axis-1 deltas, read by the anti-join through a genuine
+      ``CoreDelay(axis=1)`` (``z⁻¹`` on the middle axis);
+    * program, EDB and seed are pushed ONCE at outer tick 0 — no
+      ``stratum_levels``, no rule placement, no guards, no per-stratum
+      stages. Stratifiability is a correctness HYPOTHESIS (validated at
+      push time), never a mechanism.
+
+    Semantics of the alternation axis: tick ``a`` computes
+    ``M_a = Γ(M_{a-1})`` where ``Γ(N)`` is the semipositive fixpoint with
+    every negation evaluated against the FROZEN reference ``N``
+    (``M_{-1} = ∅``). The freeze is structural, not scheduled: the reference
+    enters through ``z⁻¹`` on axis 1 and nothing is pushed at inner
+    coordinates > 0, so within a tick the anti-join's integrals hold it
+    constant — negation can never read a wire that moves during the inner
+    fixpoint (the guard-based driver's fatal flaw). ``Γ`` is antitone, so
+    even ticks over-approximate, odd ticks under-approximate, and for
+    stratifiable programs both limits meet at the perfect model in at most
+    ``max stratum + 2`` ticks; transient over-derivations are retracted by
+    NEGATIVE WEIGHTS flowing through the joins' cross-axis delta terms.
+    Convergence is detected as physical quiescence: an alternation tick all
+    of whose cells read zero (the ``fix_unique`` criterion — zero delta at
+    a strict-feedback fixpoint is stable forever).
+
+    Same single-batch ``push_rules`` / ``push_facts`` / ``saturate`` API as
+    the other drivers."""
+
+    def __init__(self, *, max_inner: int = 8192, max_alternation: int = 64) -> None:
+        self._max_inner = max_inner
+        self._max_alternation = max_alternation
+        self._rule_group = ZSetAddition[dlg.Rule]()
+        self._fact_group = ZSetAddition[dlg.Fact]()
+        self._rules: ZSet[dlg.Rule] = ZSet({})
+        self._facts: ZSet[dlg.Fact] = ZSet({})
+
+    def push_rules(self, rules: ZSet[dlg.Rule]) -> None:
+        merged = self._rule_group.add(self._rules, rules)
+        _check_stratifiable(merged)  # hypothesis, not mechanism: levels are never computed
+        dlg.check_interpreted_safety(merged)
+        self._rules = merged
+
+    def push_facts(self, facts: ZSet[dlg.Fact]) -> None:
+        self._facts = self._fact_group.add(self._facts, facts)
+
+    def saturate(self) -> ZSet[dlg.Fact]:
+        fg, rug = self._fact_group, self._rule_group
+        rg = ZSetAddition[dlg.ProvenanceIndexedRewrite]()
+        e = Evaluator[Time](
+            circuit=Circuit[Time](), storage=DictStorage(), ctx=ComputeCtx(lattice=dbsp_time(3)), group=fg
+        )
+        edb_1d = Input[ZSet[dlg.Fact]](frontier=Antichain(dbsp_time(1))).connect(e.circuit, ())
+        program_1d = Input[ZSet[dlg.Rule]](frontier=Antichain(dbsp_time(1))).connect(e.circuit, ())
+        sf = Input[ZSet[dlg.Fact]](frontier=Antichain(dbsp_time(3))).connect(e.circuit, ())
+        sr = Input[ZSet[dlg.ProvenanceIndexedRewrite]](frontier=Antichain(dbsp_time(3))).connect(e.circuit, ())
+        neg_ref = Input[ZSet[dlg.Fact]](frontier=Antichain(dbsp_time(3))).connect(e.circuit, ())
+        seed = Input[ZSet[dlg.ProvenanceIndexedRewrite]](frontier=Antichain(dbsp_time(1))).connect(e.circuit, ())
+        program_2d = LiftStreamIntroduction[ZSet[dlg.Rule]](group=rug).connect(e.circuit, (program_1d,))
+        program_3d = LiftStreamIntroduction[ZSet[dlg.Rule]](group=rug).connect(e.circuit, (program_2d,))
+        body = IncrementalDatalogBodyWithNegation(
+            fact_group=fg, rule_group=rug, rewrite_group=rg, signal_group=ZSetAddition[dlg.Signal](),
+            dir_group=ZSetAddition[dlg.Direction](),
+            gatekeep_group=ZSetAddition[dlg.AtomWithSourceRewriteAndProvenance](),
+        ).connect(e.circuit, (edb_1d, program_3d, sf, sr, seed, neg_ref))
+        e.push(edb_1d, self._facts)
+        e.push(program_1d, self._rules)
+        e.push(seed, ZSet({(0, dlg._rewrite_monoid.identity()): 1}))
+
+        model: dict[dlg.Fact, int] = {}
+        prev_depth = 0  # cross-tick join terms can fire at any inner i seen last tick
+        for a in range(self._max_alternation):
+            tick_delta: dict[dlg.Fact, int] = {}
+            depth = 0
+            i = 0
+            while i < self._max_inner:
+                diff_facts, diff_rewrites = e.read(body, (0, a, i))
+                if not diff_facts.inner and not diff_rewrites.inner:
+                    if i >= prev_depth:
+                        break
+                else:
+                    depth = i + 1
+                for f, m in diff_facts.inner.items():
+                    tick_delta[f] = tick_delta.get(f, 0) + m
+                e.push(sf, diff_facts, t=(0, a, i))
+                e.push(sr, diff_rewrites, t=(0, a, i))
+                i += 1
+            else:
+                raise RuntimeError(f"alternation tick {a} did not converge in {self._max_inner} inner ticks")
+            if depth == 0:  # physically quiescent tick: zero delta at the fixpoint, stable forever
+                return _without_internal_facts(ZSet({f: m for f, m in model.items() if m != 0}))
+            for f, m in tick_delta.items():
+                model[f] = model.get(f, 0) + m
+            # the alternation feedback: the model's axis-1 delta, consumed at
+            # tick a+1 through the in-circuit z⁻¹ on axis 1
+            e.push(neg_ref, ZSet({f: m for f, m in tick_delta.items() if m != 0}), t=(0, a, 0))
+            prev_depth = depth
+        raise RuntimeError(
+            f"alternating fixpoint did not converge within {self._max_alternation} ticks "
+            f"(non-total well-founded model? stratifiability is checked at push time)"
+        )

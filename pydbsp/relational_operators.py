@@ -295,7 +295,18 @@ class IncrementalDatalogWithNegationBody(Operator):
 
     ``inputs = (edb_1d, program_2d, state_facts_2d, state_rewrites_2d,
     seed_1d)``. Output at each ``(outer, inner)`` cell is the pair
-    ``(facts_diff, rewrites_diff)``."""
+    ``(facts_diff, rewrites_diff)``.
+
+    SPLIT NEGATION PORT (optional 6th input ``neg_ref_1d``): when given,
+    the negation test (``anti_product``) reads THIS input — imported into
+    the inner clock via ``LiftStreamIntroduction`` (δ₀, integrated inside
+    the join), hence FROZEN along the inner fixpoint — instead of the
+    moving in-loop facts wire. Positive derivation is untouched. This is
+    the semipositive circuit with the negation reference decoupled from
+    the seed: the building block of the alternating-fixpoint stratified
+    evaluator (:class:`pydbsp.datalog_stratified.DatalogAlternating`).
+    With 5 inputs, behavior is exactly as before (negation reads the
+    in-loop facts; correct for single-stratum negation only)."""
 
     fact_group: ZSetAddition[dlg.Fact]
     rule_group: ZSetAddition[dlg.Rule]
@@ -309,12 +320,14 @@ class IncrementalDatalogWithNegationBody(Operator):
         circuit: Circuit[Time],
         inputs: tuple[NodeId, ...],
     ) -> NodeId:
-        if len(inputs) != 5:
+        if len(inputs) not in (5, 6):
             raise ValueError(
                 f"IncrementalDatalogWithNegationBody takes 5 inputs "
-                f"(edb, program, state_facts, state_rewrites, seed); got {len(inputs)}"
+                f"(edb, program, state_facts, state_rewrites, seed) or 6 "
+                f"(…, neg_ref); got {len(inputs)}"
             )
-        edb_1d, program_2d, state_facts_2d, state_rewrites_2d, seed_1d = inputs
+        edb_1d, program_2d, state_facts_2d, state_rewrites_2d, seed_1d = inputs[:5]
+        neg_ref_1d = inputs[5] if len(inputs) == 6 else None
 
         edb_2d = LiftStreamIntroduction[ZSet[dlg.Fact]](group=self.fact_group).connect(circuit, (edb_1d,))
         seed_2d = LiftStreamIntroduction[ZSet[dlg.ProvenanceIndexedRewrite]](group=self.rewrite_group).connect(
@@ -324,6 +337,15 @@ class IncrementalDatalogWithNegationBody(Operator):
         delayed_facts = LiftDelay[ZSet[dlg.Fact]](group=self.fact_group).connect(circuit, (state_facts_2d,))
         delayed_rewrites = LiftDelay[ZSet[dlg.ProvenanceIndexedRewrite]](group=self.rewrite_group).connect(
             circuit, (state_rewrites_2d,)
+        )
+
+        # Negation reference: the frozen split port when provided (imported via
+        # δ₀ = LiftStreamIntroduction; the anti-join's internal integral holds it
+        # constant along the inner clock), else the moving in-loop facts.
+        neg_ref_wire = (
+            LiftStreamIntroduction[ZSet[dlg.Fact]](group=self.fact_group).connect(circuit, (neg_ref_1d,))
+            if neg_ref_1d is not None
+            else delayed_facts
         )
 
         sig_2d = Lift1[ZSet[dlg.Rule], ZSet[dlg.Signal]](f=dlg.sig).connect(circuit, (program_2d,))
@@ -406,7 +428,7 @@ class IncrementalDatalogWithNegationBody(Operator):
             group_a=self.gatekeep_group,
             group_b=self.fact_group,
             out_group=self.rewrite_group,
-        ).connect(circuit, (negative_atoms, delayed_facts))
+        ).connect(circuit, (negative_atoms, neg_ref_wire))
 
         # final_product = product + proj - anti_product + interp_proj
         product_plus_proj = Lift2[
