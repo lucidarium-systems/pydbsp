@@ -18,13 +18,19 @@ import pytest
 
 from pydbsp.datalog import Skolem, register_interpreted
 from pydbsp.datalog_stratified import (
+    DatalogStratifiedComposition,
     DatalogWithNegation,
     IncrementalDatalogStratified,
     IndexedDatalogWithNegation,
 )
 from pydbsp.zset import ZSet
 
-DRIVERS = [IndexedDatalogWithNegation, DatalogWithNegation, IncrementalDatalogStratified]
+DRIVERS = [
+    IndexedDatalogWithNegation,
+    DatalogWithNegation,
+    IncrementalDatalogStratified,
+    DatalogStratifiedComposition,
+]
 
 
 def _rules(*rs) -> ZSet:
