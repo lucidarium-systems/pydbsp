@@ -141,6 +141,9 @@ CHAIN = {
 
 def gen(rng: random.Random) -> tuple[dict, dict]:
     rules: dict = dict(CHAIN)
+    # class-1 bias: ~1/4 of programs negate EDB predicates ONLY (semipositive
+    # by construction) — random IDB-heavy pools starve the semipositive quota.
+    edb_only_neg = rng.random() < 0.25
     # level-0 recursion: binary TC (a positive cycle NOT downstream of negation)
     if rng.random() < 0.6:
         rules[(("reach", ("?X", "?Y")), ("edge", ("?X", "?Y")))] = 1
@@ -161,7 +164,10 @@ def gen(rng: random.Random) -> tuple[dict, dict]:
                 body = [(rng.choice(base + derived), ("?X",))
                         for _ in range(rng.randint(1, 2))]
                 nnegs = rng.choices([0, 1, 2], weights=[3, 6, 1])[0]
-                pool = lower_idb + (["e0", "e1"] if rng.random() < 0.4 else [])
+                if edb_only_neg:
+                    pool = ["e0", "e1", "go"]
+                else:
+                    pool = lower_idb + (["e0", "e1"] if rng.random() < 0.4 else [])
                 for np_ in rng.sample(pool, k=min(nnegs, len(pool))):
                     body.append(("!" + np_, ("?X",)))
                 rules[((p, ("?X",)), *body)] = 1
@@ -176,7 +182,8 @@ def gen(rng: random.Random) -> tuple[dict, dict]:
 
     # explicit ghost motif sometimes, so class 3 is never starved: a head
     # guarded by a LATE derived blocker feeds a fresh positive 2-cycle.
-    if rng.random() < 0.35:
+    # (skipped in EDB-only mode: it negates `slow`, an IDB pred)
+    if not edb_only_neg and rng.random() < 0.35:
         rules[(("gb", ("?X",)), ("e0", ("?X",)), ("!slow", ("?X",)))] = 1
         rules[(("gp", ("?X",)), ("gb", ("?X",)))] = 1
         rules[(("gq", ("?X",)), ("gp", ("?X",)))] = 1
