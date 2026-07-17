@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import pytest
 
-from pydbsp import datalog as dlg
 from pydbsp.datalog_stratified import DatalogWithNegation, IndexedDatalogWithNegation
 from pydbsp.zset import ZSet
 
