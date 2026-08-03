@@ -218,11 +218,18 @@ def test_axis_introduction_forward_inserts_omega() -> None:
 
 
 def test_axis_introduction_backward_drops_axis() -> None:
+    """v2.1.2: only dead elements settled to OMEGA on the introduced
+    axis project down — a finite coordinate there leaves cells that
+    higher introduced-axis reads still serve."""
     op = AxisIntroduction[tuple[int, int]](input=0, axis=1)
-    F = Antichain(Time2D, [(5, 3)])
-    out = op.backward(F)[0]
+    finite = Antichain(Time2D, [(5, 3)])
+    out = op.backward(finite)[0]
     assert isinstance(out.lattice, DBSPTime)
     assert out.lattice.nestedness == 1
+    assert out.elements == []
+
+    settled = Antichain(Time2D, [(5, OMEGA)])
+    out = op.backward(settled)[0]
     assert out.elements == [(5,)]
 
 
@@ -304,7 +311,9 @@ def test_backward_through_identity() -> None:
         Identity(input=0),
     ]
     deads = propagate_backward(nodes, cursors={1: F})
-    assert deads[0] == F
+    # v2.1.2: the seed is dead_below(F) — strictly below the cursor,
+    # so the at-cursor cell stays readable.
+    assert deads[0].elements == [(4,)]
 
 
 def test_backward_meet_at_fanin_takes_smaller() -> None:
@@ -322,7 +331,9 @@ def test_backward_meet_at_fanin_takes_smaller() -> None:
             2: Antichain(Time1D, [(3,)]),
         },
     )
-    assert deads[0].elements == [(3,)]
+    # dead_below of the two cursors is {(4,)} and {(2,)}; their meet is
+    # the smaller: consumer B may still resume at (3,).
+    assert deads[0].elements == [(2,)]
 
 
 def test_backward_integrate_keeps_one_self_slot() -> None:
@@ -334,8 +345,11 @@ def test_backward_integrate_keeps_one_self_slot() -> None:
         Feedback(input=0, self_id=1, axis=0),
     ]
     deads = propagate_backward(nodes, cursors={1: F})
-    assert deads[0].elements == [(5,)]  # input fully consumed
-    assert deads[1].elements == [(4,)]  # only self.5 retained
+    # v2.1.2: seed = dead_below({5}) = {4}; the input keeps its cell at
+    # (5,) for boundary recomputes, and the self-edge keeps the memo at
+    # (4,) plus the cursor cell (5,): the snapshot-plus-deltas optimum.
+    assert deads[0].elements == [(4,)]
+    assert deads[1].elements == [(3,)]
 
 
 def test_backward_nested_integrate_keeps_one_slot_at_each_level() -> None:
@@ -347,9 +361,9 @@ def test_backward_nested_integrate_keeps_one_slot_at_each_level() -> None:
         Feedback(input=1, self_id=2, axis=0),  # 2: outer
     ]
     deads = propagate_backward(nodes, cursors={2: F})
-    assert deads[0].elements == [(5,)]  # input fully consumed
-    assert deads[1].elements == [(4,)]  # one inner slot retained
-    assert deads[2].elements == [(4,)]  # one outer slot retained
+    assert deads[0].elements == [(4,)]  # input keeps the (5,) cell
+    assert deads[1].elements == [(3,)]  # inner boundary memo retained
+    assert deads[2].elements == [(3,)]  # outer boundary memo retained
 
 
 def test_backward_multi_root_meets_at_shared_ancestor() -> None:
@@ -365,7 +379,8 @@ def test_backward_multi_root_meets_at_shared_ancestor() -> None:
             2: Antichain(Time1D, [(2,)]),
         },
     )
-    assert deads[0].elements == [(2,)]
+    # meet of dead_below({7}) = {6} and dead_below({2}) = {1}.
+    assert deads[0].elements == [(1,)]
 
 
 def test_backward_skips_nodes_unreached_by_any_cursor() -> None:
@@ -379,5 +394,5 @@ def test_backward_skips_nodes_unreached_by_any_cursor() -> None:
         cursors={1: Antichain(Time1D, [(5,)])},
     )
     assert 2 not in deads
-    assert deads[0].elements == [(5,)]
-    assert deads[1].elements == [(5,)]
+    assert deads[0].elements == [(4,)]
+    assert deads[1].elements == [(4,)]

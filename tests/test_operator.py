@@ -163,7 +163,8 @@ def test_lift1_propagation_forward_and_backward() -> None:
     fwd = propagate_forward(dag)
     assert fwd[y].elements == [(5,)]
     deads = propagate_backward(dag, cursors={y: fwd[y]})
-    assert deads[x].elements == [(5,)]
+    # v2.1.2: the seed is dead_below of the cursor, passed through.
+    assert deads[x].elements == [(4,)]
 
 
 def test_lift2_progress_meet_at_fanin() -> None:
@@ -198,8 +199,10 @@ def test_integrate_progress_strict_feedback() -> None:
     fwd = propagate_forward(dag)
     assert fwd[s].elements == [(5,)]
     deads = propagate_backward(dag, cursors={s: fwd[s]})
-    assert deads[x].elements == [(5,)]
-    assert deads[s].elements == [(4,)]  # one slot retained
+    # v2.1.2: input keeps its (5,) delta for boundary recomputes, and
+    # the self-edge keeps the boundary memo (4,) plus the cursor (5,).
+    assert deads[x].elements == [(4,)]
+    assert deads[s].elements == [(3,)]
 
 
 def test_differentiate_progress_emerges_as_retreat_via_composition() -> None:
@@ -215,9 +218,10 @@ def test_differentiate_progress_emerges_as_retreat_via_composition() -> None:
     fwd = propagate_forward(dag)
     assert fwd[out].elements == [(5,)]  # forward unchanged
     deads = propagate_backward(dag, cursors={out: fwd[out]})
-    # Input is reached via two paths: direct (cursor=F) + Delay's retreat
-    # (F-1). Walker meets them → retreat wins: {(4,)}.
-    assert deads[x].elements == [(4,)]
+    # Input is reached via two paths: direct (dead_below = {(4,)}) and
+    # the Delay path (its retreat, {(3,)}). The walker meets them and
+    # the retreat path wins.
+    assert deads[x].elements == [(3,)]
 
 
 def test_time_axis_introduction_progress_lifts_arity() -> None:
@@ -284,8 +288,8 @@ def test_pipeline_progress_advances_over_input_ticks() -> None:
 
     # Backward GC at the integrate's cursor.
     deads = propagate_backward(dag, cursors={s: fwd[s]})
-    assert deads[s].elements == [(4,)]  # one Integrate slot retained
-    assert deads[m].elements == [(5,)]
-    assert deads[dx].elements == [(5,)]
-    assert deads[y].elements == [(5,)]
-    assert deads[x].elements == [(4,)]  # retreat through Delay
+    assert deads[s].elements == [(3,)]  # boundary memo + cursor retained
+    assert deads[m].elements == [(4,)]
+    assert deads[dx].elements == [(4,)]
+    assert deads[y].elements == [(4,)]
+    assert deads[x].elements == [(3,)]  # retreat through Delay

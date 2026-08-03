@@ -214,11 +214,12 @@ def test_compact_evicts_dominated_entries() -> None:
     cursor: Antichain[Time] = Antichain(dbsp_time(1), cast(list[Time], [(3,)]))
     e.compact(cursors={s: cursor})
 
-    # x is fully consumed by Integrate at cursor (3,) → all evicted.
-    assert e.storage.size(x) == 0
-    # s keeps one slot — at (3,) (the cursor itself); everything ≤ (2,)
-    # is dead (retreat).
-    assert e.storage.times(s) == [(3,)]
+    # v2.1.2: the dead sits strictly below what at-or-after reads can
+    # recompute through. x keeps (3,) (the delta a recompute of s at
+    # (3,) reads), and s keeps the boundary memo (2,) plus the cursor
+    # cell (3,): the snapshot-plus-deltas optimum.
+    assert e.storage.times(x) == [(3,)]
+    assert e.storage.times(s) == [(2,), (3,)]
 
 
 def test_compact_returns_eviction_count() -> None:
@@ -231,9 +232,9 @@ def test_compact_returns_eviction_count() -> None:
         e.read(s, (t,))
     cursor: Antichain[Time] = Antichain(dbsp_time(1), cast(list[Time], [(2,)]))
     n = e.compact(cursors={s: cursor})
-    # x: 3 entries (0,1,2) all in down-set of (2,) → 3 evicted.
-    # s: 3 entries (0,1,2); dead = retreat({2}) = {1} → entries (0,1) → 2 evicted.
-    assert n == 5
+    # x: dead = {(1,)} → entries (0,), (1,) → 2 evicted; (2,) stays for
+    # boundary recomputes. s: dead = {(0,)} → 1 evicted.
+    assert n == 3
 
 
 def test_compact_no_args_uses_frontiers_1d() -> None:
@@ -252,12 +253,13 @@ def test_compact_no_args_uses_frontiers_1d() -> None:
 
     n = e.compact()  # no cursors
 
-    # Input frontier = {(2,)} → all 3 input cells (≤ (2,)) evicted.
-    # Integrate frontier = {(2,)}; Feedback retreats self → dead = {(1,)};
-    # cells (0,) and (1,) of s evicted, (2,) survives.
-    assert e.storage.times(x) == []
-    assert e.storage.times(s) == [(2,)]
-    assert n == 5
+    # Input frontier {(2,)} → dead {(1,)} → cells (0,), (1,) evicted,
+    # (2,) survives for boundary recomputes. Integrate frontier {(2,)}
+    # → dead {(0,)} → cell (0,) evicted, boundary memo (1,) and the
+    # frontier cell (2,) survive.
+    assert e.storage.times(x) == [(2,)]
+    assert e.storage.times(s) == [(1,), (2,)]
+    assert n == 3
 
 
 def test_compact_no_args_carries_omega_through_lift_intro() -> None:
@@ -297,9 +299,10 @@ def test_compact_no_args_carries_omega_through_lift_intro() -> None:
     e.compact()
     # Without OMEGA on inner the inner-axis machinery would leak (the
     # well-known meet-poisoning via retreat-to-empty). With OMEGA the
-    # whole 2-D Integrate column collapses to one cell.
-    assert e.storage.times(cum_2d) == [(2, 0)]
-    assert e.storage.times(x) == []
+    # 2-D Integrate column collapses to the boundary slice at outer 1
+    # plus the frontier cell, and the 1-D input keeps its last delta.
+    assert e.storage.times(cum_2d) == [(1, 0), (2, 0)]
+    assert e.storage.times(x) == [(2,)]
 
 
 def test_compact_no_args_preserves_correctness_after_eviction() -> None:
@@ -337,11 +340,11 @@ def test_compact_explicit_cursors_still_work() -> None:
     cursor: Antichain[Time] = Antichain(dbsp_time(1), cast(list[Time], [(1,)]))
     e.compact(cursors={s: cursor})
 
-    # Only entries ≤ (1,) (modulo retreat for Integrate) are touched.
-    # x: (0,), (1,) evicted; (2,), (3,) survive.
-    assert e.storage.times(x) == [(2,), (3,)]
-    # s: dead = retreat({1}) = {0}; only (0,) evicted; (1,), (2,), (3,) survive.
-    assert e.storage.times(s) == [(1,), (2,), (3,)]
+    # Cursor (1,): x dead = {(0,)} → only (0,) evicted. s dead:
+    # dead_below({1}) = {(0,)} met with the self-retreat, which hits
+    # the axis bottom → empty antichain → annihilates → s keeps all.
+    assert e.storage.times(x) == [(1,), (2,), (3,)]
+    assert e.storage.times(s) == [(0,), (1,), (2,), (3,)]
 
 
 def test_compact_no_args_correct_across_multi_outer_streaming() -> None:
