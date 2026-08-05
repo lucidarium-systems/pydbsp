@@ -1,6 +1,6 @@
 [project]
 name = "pydbsp"
-version = "2.1.2"
+version = "2.1.3"
 description = "A pure-python implementation of the database signal processing theory stream processing paradigm"
 authors = [{ name = "brurucy", email = "brurucy@gmail.com" }]
 license = "MIT"

@@ -421,14 +421,19 @@ def ext_dir(program: Program) -> ExtendedProvenanceChain:
 
 
 def jorder(program: Program) -> ZSet[tuple[str, ColumnReference]]:
-    """Unique ``(pred, col_ref)`` pairs across all rule body atoms."""
+    """``(pred, col_ref)`` pairs across all rule body atoms, ACCUMULATING
+    shared pairs -- same linearity requirement as :func:`dir` (C5 Def 4.6
+    defines the join order Z-set as weighted). The distinct after the
+    index join renormalizes the multiplicities, and linearity is what
+    retracts an index configuration when its last rule is removed."""
     entries: dict[tuple[str, ColumnReference], int] = {}
     for rule, weight in program.inner.items():
-        if weight <= 0:
+        if weight == 0:
             continue
         for body_atom, col_ref in _rule_col_refs(rule):
-            entries[(body_atom[0].lstrip("!"), col_ref)] = 1
-    return ZSet(entries)
+            key = (body_atom[0].lstrip("!"), col_ref)
+            entries[key] = entries.get(key, 0) + weight
+    return ZSet({k: w for k, w in entries.items() if w != 0})
 
 
 def _index_fact(col_ref: ColumnReference, fact: Fact) -> IndexedFact:

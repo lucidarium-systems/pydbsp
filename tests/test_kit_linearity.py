@@ -8,7 +8,7 @@ of Pi_path share their first-atom direction), and rule DELETION of one
 sharer then annihilated the survivors' entry. Fixed in 0754ed2; these
 tests pin it."""
 
-from pydbsp.datalog import dir, ext_dir, sig
+from pydbsp.datalog import dir, ext_dir, jorder, sig
 from pydbsp.zset import ZSet, ZSetAddition
 
 SEED = (("path", ("?X", "?Y")), ("edge", ("?X", "?Y")))
@@ -46,3 +46,22 @@ def test_shared_direction_survives_single_rule_deletion() -> None:
     after = g.add(state, dir(ZSet({TRANS: -1})))
     shared = [w for (prev, _run, _dep), w in after.inner.items() if prev == 0]
     assert shared == [1]
+
+
+def test_jorder_is_linear() -> None:
+    """jorder(a + b) == jorder(a) + jorder(b): shared (pred, col_ref)
+    pairs accumulate weight, and removing one sharer keeps the survivor
+    (C5 Def 4.6: the join order Z-set is weighted)."""
+    seed = (("path", ("?X", "?Y")), ("edge", ("?X", "?Y")))
+    trans = (("path", ("?X", "?Z")), ("edge", ("?X", "?Y")), ("path", ("?Y", "?Z")))
+    both = ZSet({seed: 1, trans: 1})
+    jo = jorder(both)
+    # seed and trans share the unindexed edge configuration.
+    assert jo.inner[("edge", ())] == 2
+    assert jo.inner[("path", (0,))] == 1
+    # Linearity: the sum of the parts equals the whole.
+    g: ZSetAddition[tuple[str, tuple[int, ...]]] = ZSetAddition()
+    assert g.add(jorder(ZSet({seed: 1})), jorder(ZSet({trans: 1}))).inner == jo.inner
+    # Removing trans annihilates its share and only its share.
+    after = g.add(jo, jorder(ZSet({trans: -1})))
+    assert after.inner == {("edge", ()): 1}
