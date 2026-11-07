@@ -34,6 +34,7 @@ from pydbsp.core import Antichain, dbsp_time
 from pydbsp.evaluate import Evaluator
 from pydbsp.indexed_relational_operators import (
     IndexedDeltaLiftedDeltaLiftedDeltaLiftedJoin,
+    IndexedIncrementalDatalogBody,
     IndexedIncrementalDatalogWithNegationBody,
     LiftGroupBy,
     LiftIndex,
@@ -1440,38 +1441,50 @@ class IndexedIncrementalDatalogStratified(IncrementalDatalogStratified):
     _indexed = True
 
 
-class IndexedDatalogWithNegation:
-    """Single-batch 2-D (outer × inner) SORT-MERGE-indexed Datalog WITH NEGATION —
-    **no stratum axis**. Same ``push_rules`` / ``push_facts`` / ``saturate`` API as
-    :class:`IncrementalDatalogStratified`, but drives only the 2-D indexed negation
-    body (:class:`~pydbsp.indexed_relational_operators.IndexedIncrementalDatalogWithNegationBody`)
-    over a single outer tick to the inner fixpoint.
+class IndexedDatalog:
+    """Persistent 2-D indexed positive Datalog driver.
 
-    CORRECT for programs whose negation is a SINGLE stratum — every negated predicate
-    is computable independently of (never recursive through) the predicate that
-    negates it. For such programs the single 2-D fixpoint coincides with the
-    stratified semantics, and this is markedly faster than the 3-D stratified driver
-    (one fewer lattice axis + far less machinery). NOT a general stratified evaluator:
-    a genuine multi-stratum program (``c :- !b`` where ``b :- !a``) needs
-    :class:`IncrementalDatalogStratified`."""
+    Each ``saturate()`` advances one outer batch, feeds pending rule/fact
+    deltas through the same circuit, and returns the full cumulative model.
+    Inputs must have set-valued cumulative contents and rules must be safe.
+    The inner scan revisits earlier coordinates while retaining all history,
+    including the deepest support from previous batches. No compaction is used.
+    """
+
+    _body_type: type[IndexedIncrementalDatalogBody] | type[IndexedIncrementalDatalogWithNegationBody] = (
+        IndexedIncrementalDatalogBody
+    )
 
     def __init__(self, *, max_inner: int = 8192) -> None:
+        if max_inner <= 0:
+            raise ValueError("max_inner must be positive")
         self._max_inner = max_inner
         self._rule_group = ZSetAddition[dlg.Rule]()
         self._fact_group = ZSetAddition[dlg.Fact]()
         self._rules: ZSet[dlg.Rule] = ZSet({})
-        self._facts: ZSet[dlg.Fact] = ZSet({})
+        self._pending_rules: ZSet[dlg.Rule] = ZSet({})
+        self._pending_facts: ZSet[dlg.Fact] = ZSet({})
+        self._model: ZSet[dlg.Fact] = ZSet({})
+        self._next_outer = 0
+        self._deepest_inner = -1
+        self._failed = False
+        self._e: Evaluator[Time] | None = None
+
+    def _validate_rules(self, rules: ZSet[dlg.Rule]) -> None:
+        if any(pred.startswith("!") or pred in dlg.INTERPRETED for r in rules.inner for pred, _ in r[1:]):
+            raise ValueError("Use IndexedDatalogWithNegation for negation or interpreted predicates")
+        _check_stratifiable(rules)
 
     def push_rules(self, rules: ZSet[dlg.Rule]) -> None:
         merged = self._rule_group.add(self._rules, rules)
-        _check_stratifiable(merged)
-        dlg.check_interpreted_safety(merged)
+        self._validate_rules(merged)
         self._rules = merged
+        self._pending_rules = self._rule_group.add(self._pending_rules, rules)
 
     def push_facts(self, facts: ZSet[dlg.Fact]) -> None:
-        self._facts = self._fact_group.add(self._facts, facts)
+        self._pending_facts = self._fact_group.add(self._pending_facts, facts)
 
-    def saturate(self) -> ZSet[dlg.Fact]:
+    def _setup_circuit(self) -> None:
         fg, rug = self._fact_group, self._rule_group
         rg = ZSetAddition[dlg.ProvenanceIndexedRewrite]()
         e = Evaluator[Time](circuit=Circuit[Time](), storage=DictStorage(), ctx=ComputeCtx(lattice=dbsp_time(2)), group=fg)
@@ -1481,24 +1494,65 @@ class IndexedDatalogWithNegation:
         sr = Input[ZSet[dlg.ProvenanceIndexedRewrite]](frontier=Antichain(dbsp_time(2))).connect(e.circuit, ())
         seed = Input[ZSet[dlg.ProvenanceIndexedRewrite]](frontier=Antichain(dbsp_time(1))).connect(e.circuit, ())
         program_2d = LiftStreamIntroduction[ZSet[dlg.Rule]](group=rug).connect(e.circuit, (program_1d,))
-        body = IndexedIncrementalDatalogWithNegationBody(
+        body = self._body_type(
             fact_group=fg, rule_group=rug, rewrite_group=rg, signal_group=ZSetAddition[dlg.Signal](),
             ext_dir_group=ZSetAddition[dlg.ExtendedDirection](), jorder_group=ZSetAddition[tuple[str, dlg.ColumnReference]](),
             gatekeep_group=ZSetAddition[dlg.IndexedGatekeepEntry](), indexed_fact_group=ZSetAddition[dlg.IndexedFact](),
         ).connect(e.circuit, (edb_1d, program_2d, sf, sr, seed))
-        e.push(edb_1d, self._facts)
-        e.push(program_1d, self._rules)
-        e.push(seed, ZSet({(0, dlg._rewrite_monoid.identity()): 1}))
-        acc: dict[dlg.Fact, int] = {}
+        e.push(seed, ZSet({(0, dlg._rewrite_monoid.identity()): 1}), t=(0,))
+        self._e = e
+        self._edb, self._program = edb_1d, program_1d
+        self._sf, self._sr, self._body = sf, sr, body
+
+    def saturate(self) -> ZSet[dlg.Fact]:
+        if self._failed:
+            raise RuntimeError("The previous batch did not converge; create a new driver")
+        if self._e is None:
+            self._setup_circuit()
+        e = self._e
+        assert e is not None
+        outer = self._next_outer
+        e.push(self._edb, self._pending_facts, t=(outer,))
+        e.push(self._program, self._pending_rules, t=(outer,))
+        self._pending_facts, self._pending_rules = ZSet({}), ZSet({})
+        # Prior fact AND rewrite support can arrive late through outer integrals.
+        # Include the entry delay before accepting an empty inner cell.
+        floor = self._deepest_inner + 1
+        batch = self._fact_group.identity()
         for k in range(self._max_inner):
-            diff_facts, diff_rewrites = e.read(body, (0, k))
-            if not diff_facts.inner and not diff_rewrites.inner:
-                break
-            for f, m in diff_facts.inner.items():
-                acc[f] = acc.get(f, 0) + m
-            e.push(sf, diff_facts, t=(0, k))
-            e.push(sr, diff_rewrites, t=(0, k))
-        return _without_internal_facts(ZSet({f: m for f, m in acc.items() if m != 0}))
+            df, dr = e.read(self._body, (outer, k))
+            if not df.inner and not dr.inner:
+                if k > floor:
+                    break
+            else:
+                self._deepest_inner = max(self._deepest_inner, k)
+                batch = self._fact_group.add(batch, df)
+                if df.inner:
+                    e.push(self._sf, df, t=(outer, k))
+                if dr.inner:
+                    e.push(self._sr, dr, t=(outer, k))
+        else:
+            self._failed = True
+            raise RuntimeError(f"outer {outer} did not converge within {self._max_inner} inner ticks")
+        self._model = self._fact_group.add(self._model, batch)
+        self._next_outer += 1
+        return _without_internal_facts(self._model)
+
+
+class IndexedDatalogWithNegation(IndexedDatalog):
+    """The same persistent 2-D driver with the indexed negation body.
+
+    Correctness requires safe rules and a cumulative program tight below
+    negation at each batch. Stratifiability and interpreted-predicate safety
+    are checked here; tightness and negation safety remain caller obligations.
+    This is not a general stratified-negation evaluator.
+    """
+
+    _body_type = IndexedIncrementalDatalogWithNegationBody
+
+    def _validate_rules(self, rules: ZSet[dlg.Rule]) -> None:
+        _check_stratifiable(rules)
+        dlg.check_interpreted_safety(rules)
 
 
 class DatalogWithNegation:
@@ -1506,7 +1560,7 @@ class DatalogWithNegation:
     non-indexed counterpart of :class:`IndexedDatalogWithNegation`, driving the plain
     :class:`~pydbsp.relational_operators.IncrementalDatalogWithNegationBody` (``pred``-based
     joins, no sort-merge index). Same ``push_rules`` / ``push_facts`` / ``saturate`` API and
-    the same single-stratum-negation correctness domain; slower (O(n²) joins) but index-free.
+    tight-below-negation correctness domain, but rebuilds on each saturation.
     Used to validate the non-indexed body against the indexed one."""
 
     def __init__(self, *, max_inner: int = 8192) -> None:
