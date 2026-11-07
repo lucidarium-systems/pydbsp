@@ -76,7 +76,8 @@ This is the toolkit on which the rest of the document depends.
 |---|---|
 | `shift(A, axis)` | per-element successor on `axis`. Empty stays empty. Universal is a fixed point |
 | `retreat(A, axis)` | per-element predecessor on `axis`. Elements at the axis bottom drop |
-| `retreat_omega_fill(A, axis)` | predecessor on `axis`, with every non-`axis` coordinate replaced by `ω`. The tight backward contribution for an edge that reads its source only at the predecessor on `axis` |
+| `retreat_omega_fill(A, axis)` | predecessor on `axis`, with every non-`axis` coordinate replaced by `ω`. HISTORICAL: the pre-v2.1.2 backward contribution, refuted in `V3/ProgressAlgebra.lean` (`rofDead_not_sound_atOrAfter`, `rofDead_not_tight_strictAdvance`); no shape uses it since v2.1.2 |
+| `dead_below(A)` | the largest antichain-representable dead region STRICTLY below the up-set of `A`: per element, one `(c[j] − 1 at axis j, ω elsewhere)` piece for every axis with `0 < c[j] < ω`, met across elements. The `maxDead` complement rule, machine-checked (`maxDead_sound` / `maxDead_maximal` / `maxDead_eq_iUnion`) |
 | `drop_axis(A, axis)` | project onto a lattice with one fewer axis by removing `axis` |
 | `insert_axis(A, axis, v)` | lift onto a lattice with one more axis by inserting `v` at `axis`. Use `ω` for "settled everywhere on this axis" |
 
@@ -105,17 +106,21 @@ Composite operators connect as multiple nodes. `Differentiate(axis)` lays down t
 
 ## Backward propagation
 
-Compaction reverses direction. `Evaluator.compact(cursors)` seeds `propagate_backward(nodes, cursors)` with caller-supplied cursors at one or more nodes, walks the arena in reverse order, and returns a per-node **dead antichain**. Storage entries whose timestamps fall in a dead down-set are evicted.
+Compaction reverses direction. `Evaluator.compact(cursors)` seeds `propagate_backward(nodes, cursors)` with caller-supplied cursors (each a promise that future reads at that node happen at-or-after some cursor element), walks the arena in reverse order, and returns a per-node **dead antichain**. Storage entries whose timestamps fall in a dead down-set are evicted.
 
-The walk is one-shot rather than fixpoint-iterating. At every node, consumer contributions are met into the accumulator before the node's own `backward` runs. For `Feedback` shapes the self-edge feeds back into the accumulator only after the call returns, so the contribution to other targets uses the pre-meet cursor. The strict-feedback theorem guarantees correctness. Iterating to fixpoint would converge to `⊥` and free nothing.
+**Seeding (v2.1.2).** The seed dead region is `dead_below` of the cursor — strictly below its up-set, so cursor cells themselves stay readable. Seeding AT the cursor was the pre-v2.1.2 rule; it evicted the at-cursor memo and is refuted as `atCursor_not_sound` in `V3/ProgressAlgebra.lean`. From the seeds on, the accumulators hold DEAD REGIONS, and each shape's `backward` transports a dead region to its inputs — the argument a shape receives is a dead region, not a reader cursor.
 
-| shape | `forward` | `backward` |
+The walk is one-shot rather than fixpoint-iterating. At every node, consumer contributions are met into the accumulator before the node's own `backward` runs. For `Feedback` shapes the self-edge feeds back into the accumulator only after the call returns, so the contribution to other targets uses the pre-meet region. Iterating to fixpoint would converge to `⊥` and free nothing.
+
+| shape | `forward` | `backward` (dead-region transport, v2.1.2+) |
 |---|---|---|
 | `Input` | stored antichain | empty (no upstream) |
 | `Identity` | passthrough | passthrough on the input |
-| `Meet` | `⊓` at fan-in | every input receives `my_cursor` |
-| `AxisShift` | `shift(input, axis)` | `retreat_omega_fill(my_cursor, axis)` on the input |
-| `AxisIntroduction` | `insert_axis(input, axis, ω)` | `drop_axis(my_cursor, axis)` on the input |
-| `Feedback` | passthrough | input gets `my_cursor`. Self-edge gets `retreat_omega_fill(my_cursor, axis)` |
+| `Meet` | `⊓` at fan-in | every input receives the dead region |
+| `AxisShift` | `shift(input, axis)` | `retreat(dead, axis)` on the input (`needed_eq_Ici`) |
+| `AxisIntroduction` | `insert_axis(input, axis, ω)` | ω-filtered `drop_axis`: only elements settled at `ω` on the introduced axis project down (`introBackward_sound` in `V3/EliminationAlgebra.lean` — an input cell is safe only when its ENTIRE output fiber is dead) |
+| `Feedback` | passthrough | input gets the dead region; self-edge gets `retreat(dead, axis)`. Sound under the boundary-memo discipline: recomputes of live cells stop at the retained boundary snapshot (`snapshotStore_sound` / `per_tick_lower_bound` — snapshot-plus-deltas is the minimum retained set) |
 
-The choice of `retreat_omega_fill` over plain `retreat` is what makes the bound tight. Concretely, `Delay(axis=0)` at cursor `(1, 29)` reads its input at `(0, 29)`. Future `Delay` reads at `(2, k)` for any `k` will read input at `(1, k)`, never at outer = 0. So every input cell with outer ≤ 0 is evictable from the perspective of this edge. The antichain `{(0, ω)}` (which `retreat_omega_fill` produces) captures exactly that, where the single-axis `retreat` (which would yield `{(0, 29)}`) leaves the cells `(0, 30..ω)` in storage.
+**History.** Until v2.1.2 the `AxisShift` and `Feedback` self-edge rows used `retreat_omega_fill` on the CURSOR, justified by a tightness argument ("Future `Delay` reads at `(2, k)` will read input at `(1, k)`, never at outer = 0"). `V3/ProgressAlgebra.lean` refuted that rule twice: it is unsound under the documented at-or-after reader contract (`rofDead_not_sound_atOrAfter`, at this document's own example cursor `(1, 29)`), and not tight even under its own strict-advance reading (`rofDead_not_tight_strictAdvance`). The tight rule is the complement of the needed up-set — the per-axis union `dead_below` now computes at the seed (`maxDead_maximal`). Sixteen pre-v2.1.2 backward tests were re-derived by hand against the corrected rules.
+
+**Caller contract caveat.** The no-arg `Evaluator.compact()` uses each node's settled frontier as its cursor — the monotone-forward contract. Drivers whose read pattern RESTARTS an axis each outer tick (a stratum or alternation walk revisits low coordinates at the next tick) violate that contract once ω-closures coarsen the frontier; they must pass explicit next-tick-start cursors instead, and the `Feedback` boundary memos then carry the history (snapshot-plus-deltas).
