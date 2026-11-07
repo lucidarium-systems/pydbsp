@@ -211,6 +211,7 @@ flycheck_*.el
 
 # Local working notes — not for commit.
 CURRENT_EFFORT.md
+Plan.md
 
 # Local tool state and caches.
 .serena/

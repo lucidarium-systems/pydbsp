@@ -184,10 +184,17 @@ class IndexedZSetAddition[I: _Comparable, T](AbelianGroupOperation[IndexedZSet[I
         #   absent from ``a``'s bucket map).
         # Relies on the convention that results are read-only after
         # construction (no post-hoc ``__setitem__``).
+        # The scheme assumes ``b`` is the small side; add is
+        # commutative, so orient the operands to guarantee it (the
+        # ``Foldl``/``Sum`` recurrence passes the cumulative as ``b``,
+        # which would otherwise fork every bucket and clone the spine
+        # on every tick).
         if not b.inner:
             return a
         if not a.inner:
             return b
+        if len(a.inner) < len(b.inner):
+            a, b = b, a
         inner: dict[T, int] = dict(a.inner)
         i2v: dict[I, set[T]] | None = None
         spine: AppendOnlySpine[I] | None = None

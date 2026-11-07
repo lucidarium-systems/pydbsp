@@ -36,6 +36,9 @@ from pydbsp.zset import ZSet, ZSetAddition
 
 from pydbsp.circuit import Circuit
 from pydbsp.operator import (
+    CoreDelay,
+    CoreIntegrate,
+    CoreTimeAxisIntroduction,
     Delay,
     Differentiate,
     Integrate,
@@ -258,6 +261,10 @@ class IndexedDeltaLiftedDeltaLiftedJoin[K: _Comparable, A, B, C](Operator):
     group_a: IndexedZSetAddition[K, A]
     group_b: IndexedZSetAddition[K, B]
     out_group: ZSetAddition[C]
+    inner_axis: int = 1
+    """Axis the second incrementalization runs on. Same meaning as
+    :attr:`pydbsp.relational_operators.DeltaLiftedDeltaLiftedJoin.inner_axis`:
+    2 on an (outer, stratum, inner) lattice leaves axis 1 pointwise."""
 
     def connect(
         self,
@@ -274,14 +281,15 @@ class IndexedDeltaLiftedDeltaLiftedJoin[K: _Comparable, A, B, C](Operator):
         int_b_o = Integrate[IndexedZSet[K, B]](group=self.group_b).connect(circuit, (diff_b,))
         del_int_b_o = Delay[IndexedZSet[K, B]](group=self.group_b).connect(circuit, (int_b_o,))
 
-        int_a_i = LiftIntegrate[IndexedZSet[K, A]](group=self.group_a).connect(circuit, (diff_a,))
-        int_b_i = LiftIntegrate[IndexedZSet[K, B]](group=self.group_b).connect(circuit, (diff_b,))
+        ax = self.inner_axis
+        int_a_i = CoreIntegrate[IndexedZSet[K, A]](axis=ax, group=self.group_a).connect(circuit, (diff_a,))
+        int_b_i = CoreIntegrate[IndexedZSet[K, B]](axis=ax, group=self.group_b).connect(circuit, (diff_b,))
 
         int_a_oi = Integrate[IndexedZSet[K, A]](group=self.group_a).connect(circuit, (int_a_i,))
         int_b_oi = Integrate[IndexedZSet[K, B]](group=self.group_b).connect(circuit, (int_b_i,))
 
-        del_int_b_i = LiftDelay[IndexedZSet[K, B]](group=self.group_b).connect(circuit, (int_b_i,))
-        del_int_b_oi = LiftDelay[IndexedZSet[K, B]](group=self.group_b).connect(circuit, (int_b_oi,))
+        del_int_b_i = CoreDelay[IndexedZSet[K, B]](axis=ax, group=self.group_b).connect(circuit, (int_b_i,))
+        del_int_b_oi = CoreDelay[IndexedZSet[K, B]](axis=ax, group=self.group_b).connect(circuit, (int_b_oi,))
 
         # Inner Lift2 is sort-merge over the shared index — O(|matching
         # keys|) per cell instead of the plain bilinear's O(|left| · |right|).
@@ -302,6 +310,69 @@ class IndexedDeltaLiftedDeltaLiftedJoin[K: _Comparable, A, B, C](Operator):
         sum_12 = Lift2[ZSet[C], ZSet[C], ZSet[C]](op=add).connect(circuit, (j1, j2))
         sum_34 = Lift2[ZSet[C], ZSet[C], ZSet[C]](op=add).connect(circuit, (j3, j4))
         return Lift2[ZSet[C], ZSet[C], ZSet[C]](op=add).connect(circuit, (sum_12, sum_34))
+
+
+@dataclass(frozen=True)
+class IndexedDeltaLiftedDeltaLiftedDeltaLiftedJoin[K: _Comparable, A, B, C](Operator):
+    """Indexed 8-term triply-incremental sort-merge join on a 3-axis lattice
+    (outer = axis 0, stratum = axis 1, inner = axis 2). The indexed analog of
+    :class:`pydbsp.datalog_stratified.DeltaLiftedDeltaLiftedDeltaLiftedJoin`:
+    identical subset-of-axes decomposition (``Δ³c = Σ_{Sₐ⊆{o,s,i}} J(z⁻¹^Sₐ I^Sₐ a,
+    I^complement b)``, 2³ = 8 terms), with the per-term value-level join replaced by
+    a :func:`sort_merge_join` over the shared key index — O(matching keys) per cell
+    instead of O(|left|·|right|).
+
+    Both operands are ``IndexedZSet[K, *]`` streams (typically ``LiftIndex`` output).
+    ``inputs = (diff_indexed_a, diff_indexed_b)``; ``proj(k, a, b) -> C | None``.
+    """
+
+    proj: Callable[[K, A, B], C | None]
+    group_a: IndexedZSetAddition[K, A]
+    group_b: IndexedZSetAddition[K, B]
+    out_group: ZSetAddition[C]
+
+    def connect(self, circuit: Circuit[Time], inputs: tuple[NodeId, ...]) -> NodeId:
+        if len(inputs) != 2:
+            raise ValueError(f"IndexedDeltaLiftedDeltaLiftedDeltaLiftedJoin takes 2 inputs; got {len(inputs)}")
+        diff_a, diff_b = inputs
+
+        # For every subset S ⊆ {0,1,2}: ``z⁻¹^S I^S diff_a`` (delayed) and ``I^S diff_b``.
+        a_paths: dict[frozenset[int], NodeId] = {frozenset(): diff_a}
+        b_paths: dict[frozenset[int], NodeId] = {frozenset(): diff_b}
+        for axis in (0, 1, 2):
+            new_a: dict[frozenset[int], NodeId] = {}
+            for subset, node in a_paths.items():
+                integrated = CoreIntegrate[IndexedZSet[K, A]](axis=axis, group=self.group_a).connect(circuit, (node,))
+                delayed = CoreDelay[IndexedZSet[K, A]](axis=axis, group=self.group_a).connect(circuit, (integrated,))
+                new_a[subset | {axis}] = delayed
+            a_paths.update(new_a)
+            new_b: dict[frozenset[int], NodeId] = {}
+            for subset, node in b_paths.items():
+                integrated = CoreIntegrate[IndexedZSet[K, B]](axis=axis, group=self.group_b).connect(circuit, (node,))
+                new_b[subset | {axis}] = integrated
+            b_paths.update(new_b)
+
+        # Inner term: sort-merge over the shared index (a single Lift2 — the lattice
+        # arity, not the lift depth, supplies the 3-D-ness; cf. LiftJoin == one Lift2).
+        proj = self.proj
+        term_op: Callable[[IndexedZSet[K, A], IndexedZSet[K, B]], ZSet[C]] = lambda la, lb: sort_merge_join(la, lb, proj)
+
+        def _join(left: NodeId, right: NodeId) -> NodeId:
+            return Lift2[IndexedZSet[K, A], IndexedZSet[K, B], ZSet[C]](op=term_op).connect(circuit, (left, right))
+
+        all_axes = frozenset({0, 1, 2})
+        terms = [
+            _join(a_paths[sa], b_paths[all_axes - sa])
+            for sa in (
+                frozenset(), frozenset({0}), frozenset({1}), frozenset({2}),
+                frozenset({0, 1}), frozenset({0, 2}), frozenset({1, 2}), frozenset({0, 1, 2}),
+            )
+        ]
+        add = self.out_group.add
+        result = terms[0]
+        for t in terms[1:]:
+            result = Lift2[ZSet[C], ZSet[C], ZSet[C]](op=add).connect(circuit, (result, t))
+        return result
 
 
 # ============================================================================
@@ -563,6 +634,16 @@ class IndexedIncrementalDatalogWithNegationBody(Operator):
     jorder_group: ZSetAddition[tuple[str, dli.ColumnReference]]
     gatekeep_group: ZSetAddition[dli.IndexedGatekeepEntry]
     indexed_fact_group: ZSetAddition[dli.IndexedFact]
+    inner_axis: int = 1
+    """Axis the iteration runs on. Same meaning as
+    :attr:`pydbsp.relational_operators.IncrementalDatalogWithNegationBody.inner_axis`:
+    2 gives the (outer, stratum, inner) body whose stratum lift is pointwise."""
+
+    def _introduce(self, circuit, node, group):
+        """delta0 on every axis from 1 up to inner_axis."""
+        for ax in range(1, self.inner_axis + 1):
+            node = CoreTimeAxisIntroduction(axis=ax, group=group).connect(circuit, (node,))
+        return node
 
     def connect(
         self,
@@ -572,14 +653,13 @@ class IndexedIncrementalDatalogWithNegationBody(Operator):
         if len(inputs) != 5:
             raise ValueError(f"IndexedIncrementalDatalogWithNegationBody takes 5 inputs; got {len(inputs)}")
         edb_1d, program_2d, state_facts_2d, state_rewrites_2d, seed_1d = inputs
+        ax = self.inner_axis
 
-        edb_2d = LiftStreamIntroduction[ZSet[dlg.Fact]](group=self.fact_group).connect(circuit, (edb_1d,))
-        seed_2d = LiftStreamIntroduction[ZSet[dlg.ProvenanceIndexedRewrite]](group=self.rewrite_group).connect(
-            circuit, (seed_1d,)
-        )
+        edb_2d = self._introduce(circuit, edb_1d, self.fact_group)
+        seed_2d = self._introduce(circuit, seed_1d, self.rewrite_group)
 
-        delayed_facts = LiftDelay[ZSet[dlg.Fact]](group=self.fact_group).connect(circuit, (state_facts_2d,))
-        delayed_rewrites = LiftDelay[ZSet[dlg.ProvenanceIndexedRewrite]](group=self.rewrite_group).connect(
+        delayed_facts = CoreDelay[ZSet[dlg.Fact]](axis=ax, group=self.fact_group).connect(circuit, (state_facts_2d,))
+        delayed_rewrites = CoreDelay[ZSet[dlg.ProvenanceIndexedRewrite]](axis=ax, group=self.rewrite_group).connect(
             circuit, (state_rewrites_2d,)
         )
 
@@ -617,6 +697,7 @@ class IndexedIncrementalDatalogWithNegationBody(Operator):
             group_a=rewrite_idx_group,
             group_b=ext_dir_idx_group,
             out_group=self.gatekeep_group,
+            inner_axis=ax,
         ).connect(circuit, (indexed_rewrites, indexed_ext_dir))
 
         indexed_facts_by_pred = LiftIndex[dlg.Fact, str](indexer=lambda f: f[0]).connect(circuit, (delayed_facts,))
@@ -641,17 +722,29 @@ class IndexedIncrementalDatalogWithNegationBody(Operator):
             group_a=fact_pred_group,
             group_b=jorder_pred_group,
             out_group=self.indexed_fact_group,
+            inner_axis=ax,
         ).connect(circuit, (indexed_facts_by_pred, indexed_jorder_by_pred))
         distinct_indexed_facts = DeltaLiftedDeltaLiftedDistinct[dli.IndexedFact](
-            inner_group=self.indexed_fact_group
+            inner_group=self.indexed_fact_group, inner_axis=ax
         ).connect(circuit, (indexed_facts_raw,))
 
         positive_atoms = LiftLiftSelect[dli.IndexedGatekeepEntry](
-            pred=lambda gk: gk[1] is None or ("!" not in gk[1][0])
+            pred=lambda gk: gk[1] is None or ("!" not in gk[1][0] and gk[1][0] not in dlg.INTERPRETED)
         ).connect(circuit, (gatekeep,))
         negative_atoms = LiftLiftSelect[dli.IndexedGatekeepEntry](
             pred=lambda gk: not (gk[1] is None or ("!" not in gk[1][0]))
         ).connect(circuit, (gatekeep,))
+        # interpreted (built-in) atoms — a stateless GUARD on the rewrite: select the
+        # gatekeep entries whose decidable predicate holds under their (ground, by
+        # safety) bindings, then project to the UNCHANGED rewrite. No facts-join, no
+        # delay → the infinite relation never materializes.
+        interp_satisfied = LiftLiftSelect[dli.IndexedGatekeepEntry](
+            pred=lambda gk: gk[1] is not None and gk[1][0] in dlg.INTERPRETED and dlg.eval_interpreted(gk[1], gk[2])
+        ).connect(circuit, (gatekeep,))
+        interp_proj = LiftLiftProject[
+            dli.IndexedGatekeepEntry,
+            dlg.ProvenanceIndexedRewrite,
+        ](f=lambda gk: (gk[0], gk[2])).connect(circuit, (interp_satisfied,))
 
         gatekeep_idx_group = IndexedZSetAddition[
             dli.JoinKey,
@@ -681,6 +774,7 @@ class IndexedIncrementalDatalogWithNegationBody(Operator):
             group_a=gatekeep_idx_group,
             group_b=indexed_fact_idx_group,
             out_group=self.rewrite_group,
+            inner_axis=ax,
         ).connect(circuit, (keyed_positive, keyed_facts))
 
         proj = LiftLiftProject[
@@ -703,6 +797,7 @@ class IndexedIncrementalDatalogWithNegationBody(Operator):
             group_a=gatekeep_idx_group,
             group_b=indexed_fact_idx_group,
             out_group=self.rewrite_group,
+            inner_axis=ax,
         ).connect(circuit, (keyed_negative, keyed_facts))
 
         # final_product = product + proj − anti_product
@@ -715,11 +810,17 @@ class IndexedIncrementalDatalogWithNegationBody(Operator):
             ZSet[dlg.ProvenanceIndexedRewrite],
             ZSet[dlg.ProvenanceIndexedRewrite],
         ](f=self.rewrite_group.neg).connect(circuit, (anti_product,))
-        final_product = Lift2[
+        final_product_neg = Lift2[
             ZSet[dlg.ProvenanceIndexedRewrite],
             ZSet[dlg.ProvenanceIndexedRewrite],
             ZSet[dlg.ProvenanceIndexedRewrite],
         ](op=self.rewrite_group.add).connect(circuit, (product_plus_proj, neg_anti))
+        # final_product = product + proj − anti_product + interp_proj
+        final_product = Lift2[
+            ZSet[dlg.ProvenanceIndexedRewrite],
+            ZSet[dlg.ProvenanceIndexedRewrite],
+            ZSet[dlg.ProvenanceIndexedRewrite],
+        ](op=self.rewrite_group.add).connect(circuit, (final_product_neg, interp_proj))
 
         indexed_final_product = LiftIndex[
             dlg.ProvenanceIndexedRewrite,
@@ -739,12 +840,13 @@ class IndexedIncrementalDatalogWithNegationBody(Operator):
             group_a=rewrite_idx_group,
             group_b=sig_idx_group,
             out_group=self.fact_group,
+            inner_axis=ax,
         ).connect(circuit, (indexed_final_product, indexed_sig))
 
         ground_plus_edb = Lift2[ZSet[dlg.Fact], ZSet[dlg.Fact], ZSet[dlg.Fact]](op=self.fact_group.add).connect(
             circuit, (ground, edb_2d)
         )
-        next_facts = DeltaLiftedDeltaLiftedDistinct[dlg.Fact](inner_group=self.fact_group).connect(
+        next_facts = DeltaLiftedDeltaLiftedDistinct[dlg.Fact](inner_group=self.fact_group, inner_axis=ax).connect(
             circuit, (ground_plus_edb,)
         )
 
@@ -754,7 +856,7 @@ class IndexedIncrementalDatalogWithNegationBody(Operator):
             ZSet[dlg.ProvenanceIndexedRewrite],
         ](op=self.rewrite_group.add).connect(circuit, (final_product, seed_2d))
         next_rewrites = DeltaLiftedDeltaLiftedDistinct[dlg.ProvenanceIndexedRewrite](
-            inner_group=self.rewrite_group
+            inner_group=self.rewrite_group, inner_axis=ax
         ).connect(circuit, (final_plus_seed,))
 
         return Lift2[

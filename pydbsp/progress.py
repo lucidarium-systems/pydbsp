@@ -120,7 +120,15 @@ def retreat_omega_fill[T: Time](antichain: Antichain[T], axis: int) -> Antichain
     At the axis bottom (no predecessor on ``axis``) the result is the
     empty antichain. Meet-with-empty in ``propagate_backward`` then
     correctly preserves the cursor cell on the downstream node
-    (annihilator of meet)."""
+    (annihilator of meet).
+
+    SUPERSEDED as a backward rule (v2.1.2): used as the AxisShift /
+    Feedback dead transport it is unsound for at-or-after readers
+    (``rofDead_not_sound_atOrAfter`` in `V3/ProgressAlgebra.lean` of
+    the Lean development) and not tight even for strictly-advancing
+    readers (``rofDead_not_tight_strictAdvance``). The walk now seeds
+    with :func:`dead_below` and transports dead regions with
+    :func:`retreat`. Kept for callers that need the old shape."""
     if antichain.is_universal:
         return antichain
     lattice = _dbsp_lattice(antichain)
@@ -132,6 +140,49 @@ def retreat_omega_fill[T: Time](antichain: Antichain[T], axis: int) -> Antichain
         if p is None:
             continue
         out.insert(cast(T, tuple(p if i == axis else OMEGA for i in range(n))))
+    return out
+
+
+def dead_below[T: Time](cursors: Antichain[T]) -> Antichain[T]:
+    """Largest antichain-representable dead region STRICTLY BELOW the
+    up-set of ``cursors``: no read at-or-after any cursor element can
+    reach a covered cell.
+
+    Per cursor element ``c``, the dead region is the union of per-axis
+    half-spaces ``{t | t[j] < c[j]}``: one antichain element
+    ``(c[j] - 1 at axis j, OMEGA elsewhere)`` for every axis ``j`` with
+    ``0 < c[j] < OMEGA``. ``c[j] == 0`` gives an empty half-space, and
+    ``c[j] == OMEGA`` a half-space with no maximal element, which an
+    antichain cannot represent: both are skipped (conservative). Across
+    cursor elements the per-element regions MEET, because a cell is
+    dead only if it is unreachable from every element the reader may
+    resume at.
+
+    Soundness and per-element maximality are machine-checked:
+    ``maxDead_sound`` / ``maxDead_maximal`` / ``maxDead_eq_iUnion`` in
+    `V3/ProgressAlgebra.lean`.
+
+    Empty ``cursors`` (a node with no permitted reads) yields the
+    universal dead. Universal ``cursors`` yields the empty dead: its
+    only element is all-``OMEGA``, and nothing representable sits
+    strictly below it."""
+    lattice = _dbsp_lattice(cursors)
+    if cursors.is_universal:
+        return Antichain(lattice)
+    if not cursors.elements:
+        return Antichain.universal(lattice)
+    n = lattice.nestedness
+    out: Antichain[T] = Antichain.universal(lattice)
+    for c in cursors.elements:
+        per_axis: Antichain[T] = Antichain(lattice)
+        for j in range(n):
+            if c[j] == OMEGA:
+                continue
+            p = lattice.factors[j].predecessor(c[j])
+            if p is None:
+                continue
+            per_axis.insert(cast(T, tuple(p if i == j else OMEGA for i in range(n))))
+        out = out.meet(per_axis)
     return out
 
 
@@ -264,7 +315,11 @@ class Meet[T: Time]:
 
 @dataclass(frozen=True)
 class AxisShift[T: Time]:
-    """forward = shift input on axis (plus ⊥ seed for empty input). Backward = retreat my cursor on the same axis.
+    """forward = shift input on axis (plus ⊥ seed for empty input).
+    Backward = retreat the dead region on the same axis: the cell at
+    ``t`` reads its input at ``t - e_axis``, so a dead down-set
+    transports to exactly its per-element predecessor
+    (``needed_eq_Ici`` in `V3/ProgressAlgebra.lean`).
 
     For ``Delay(axis)``. Strict. By ``delay_strict`` in the theory.
     """
@@ -288,7 +343,7 @@ class AxisShift[T: Time]:
         return shifted
 
     def backward(self, my_cursor: Antichain[T]) -> dict[NodeId, Antichain[T]]:
-        return {self.input: retreat_omega_fill(my_cursor, self.axis)}
+        return {self.input: retreat(my_cursor, self.axis)}
 
 
 @dataclass(frozen=True)
@@ -309,7 +364,19 @@ class AxisIntroduction[T: Time]:
         return cast(Antichain[T], insert_axis(input_frontiers[self.input], self.axis, OMEGA))
 
     def backward(self, my_cursor: Antichain[T]) -> dict[NodeId, Antichain[T]]:
-        return {self.input: cast(Antichain[T], drop_axis(my_cursor, self.axis))}
+        # Only dead elements settled to OMEGA on the introduced axis
+        # project down: an element finite there covers only a bounded
+        # slice of the introduced axis, while the (axis-free) input
+        # cell also serves reads above that slice. Projecting it would
+        # evict a cell those reads still need.
+        if my_cursor.is_universal:
+            return {self.input: cast(Antichain[T], drop_axis(my_cursor, self.axis))}
+        lat = _dbsp_lattice(my_cursor)
+        omega_only: Antichain[T] = Antichain(lat)
+        for e in my_cursor.elements:
+            if e[self.axis] == OMEGA:
+                omega_only.insert(e)
+        return {self.input: cast(Antichain[T], drop_axis(omega_only, self.axis))}
 
 
 @dataclass(frozen=True)
@@ -321,15 +388,22 @@ class Feedback[T: Time]:
     feedback body's value at ``t`` is fully determined by input at
     ``t`` and self at ``t-1``. Both of which are already settled.
 
-    backward includes both edges: the external input gets ``my_cursor``
-    pointwise. ``self_id`` gets the strict-feedback self bound. For
-    each cursor element, predecessor on ``self.axis`` with ``OMEGA`` on
-    every other axis. That OMEGA-fill expresses the theorem fully:
-    "for any inner / cross-axis position, only the cell at the current
-    outer is needed". A plain ``retreat(my_cursor, axis)`` (single-axis
-    only) leaves cells at the current outer but earlier non-self axes
-    in storage, which is sound but conservative. The OMEGA-fill makes
-    the bound tight.
+    backward includes both edges: the external input gets the dead
+    region pointwise, and ``self_id`` gets its ``retreat`` on the
+    axis. The retreat keeps the boundary slice one step above the dead
+    region alive on EVERY other-axis coordinate the region does not
+    claim (the old ``retreat_omega_fill`` claimed ``OMEGA`` there and
+    evicted cross-axis boundary cells that deeper later saturations
+    recompute through: the exact 2-D streaming hazard described in
+    ``Evaluator.compact``).
+
+    This is the snapshot-plus-deltas discipline: recomputes of live
+    cells stop at the retained boundary memo, which
+    ``snapshotStore_sound`` / ``per_tick_lower_bound`` in
+    `V3/ProgressAlgebra.lean` prove is a minimum-cardinality correct
+    retained set. It relies on the memo invariant: the boundary cell
+    was computed (hence stored) before the compact. Any past read
+    at-or-above it did this.
 
     At the axis bottom (no predecessor on ``self.axis``), the bound is
     the empty antichain. Meet-with-empty in ``propagate_backward`` then
@@ -353,7 +427,7 @@ class Feedback[T: Time]:
     def backward(self, my_cursor: Antichain[T]) -> dict[NodeId, Antichain[T]]:
         return {
             self.input: my_cursor,
-            self.self_id: retreat_omega_fill(my_cursor, self.axis),
+            self.self_id: retreat(my_cursor, self.axis),
         }
 
 
@@ -380,30 +454,39 @@ def propagate_backward[T: Time](
     """Compute every node's dead antichain from roots to input nodes.
 
     ``nodes`` is the arena (e.g. ``circuit.progress_rules``). ``cursors``
-    seeds the walk. Typically the root(s) the caller is observing,
-    but cursors at intermediate nodes work too. Multiple seeds are
-    supported. Their contributions meet at fan-in.
+    seeds the walk: each is a promise that future reads at that node
+    happen at-or-after some cursor element. The seed dead region is
+    :func:`dead_below` of the cursor, STRICTLY below its up-set, so the
+    cursor cells themselves stay readable (v2.1.2; seeding at the
+    cursor itself evicted the at-cursor memo, ``atCursor_not_sound`` in
+    `V3/ProgressAlgebra.lean`). Multiple seeds are supported. Their
+    contributions meet at fan-in.
 
     At every node (in reverse arena order):
 
     * if it has consumers, their backward contributions have already
       been met into ``deads[node]`` by the time we visit it.
     * we then call ``shape.backward(deads[node])`` and meet each
-      returned entry into the target's accumulator.
+      returned entry into the target's accumulator. The accumulator
+      holds DEAD regions throughout, and each shape transports a dead
+      region to its inputs (``retreat`` for AxisShift and the Feedback
+      self-edge, passthrough for Identity/Meet and the Feedback input,
+      OMEGA-filtered projection for AxisIntroduction).
 
     For ``Feedback`` shapes, one of the returned targets is ``self_id``
     (= the node's own index) carrying ``retreat(F, axis)``. The meet
     refines ``deads[node]`` *after* the call has already produced
     contributions for other targets using the pre-meet ``F``. This
     one-shot semantics . *not* fixpoint iteration. Is correct under
-    the strict-feedback theorem: only the most-recent self-slot is
-    needed (which is exactly what ``retreat(F)``'s down-set encodes).
-    Iterating to fixpoint would converge to ``⊥`` (GC nothing). Conservative but wasteful.
+    the boundary-memo discipline: recomputes of live cells stop at the
+    retained boundary snapshot (``snapshotStore_sound`` in the Lean
+    development). Iterating to fixpoint would converge to ``⊥`` (GC
+    nothing). Conservative but wasteful.
 
     Returns ``{i: dead_antichain}`` for every reached node. Nodes not
     reachable from any cursor are absent.
     """
-    deads: dict[NodeId, Antichain[T]] = dict(cursors)
+    deads: dict[NodeId, Antichain[T]] = {n: dead_below(a) for n, a in cursors.items()}
     for i in range(len(nodes) - 1, -1, -1):
         if i not in deads:
             continue

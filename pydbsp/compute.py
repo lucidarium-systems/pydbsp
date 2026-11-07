@@ -48,8 +48,7 @@ the algebraic primitives:
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
-from functools import partial
+from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
 from pydbsp.core import AbelianGroupOperation, DBSPTime
@@ -134,9 +133,7 @@ class Apply[V_out]:
         reads: tuple[Callable[[Time], Any], ...],
         ctx: ComputeCtx,
     ) -> V_out:
-        input_compute = Get[Any]()
-        values = [input_compute.compute(t, (r,), ctx) for r in reads]
-        return self.f(*values)
+        return self.f(*(r(t) for r in reads))
 
 
 @dataclass(frozen=True)
@@ -156,7 +153,8 @@ class Map[V_in, V_out]:
         reads: tuple[Callable[[Time], V_in]],
         ctx: ComputeCtx,
     ) -> V_out:
-        return self.f(Get[V_in]().compute(t, reads, ctx))
+        (read,) = reads
+        return self.f(read(t))
 
 
 @dataclass(frozen=True)
@@ -178,9 +176,7 @@ class ZipWith[V_l, V_r, V_out]:
         ctx: ComputeCtx,
     ) -> V_out:
         read_l, read_r = reads
-        l_value = Get[V_l]().compute(t, (read_l,), ctx)
-        r_value = Get[V_r]().compute(t, (read_r,), ctx)
-        return self.op(l_value, r_value)
+        return self.op(read_l(t), read_r(t))
 
 
 @dataclass(frozen=True)
@@ -205,8 +201,8 @@ class Prev[V]:
         pred = chain.predecessor(t[self.axis])
         if pred is None:
             return self.group.identity()
-        pred_t = tuple(pred if i == self.axis else x for i, x in enumerate(t))
-        return read(pred_t)
+        axis = self.axis
+        return read(t[:axis] + (pred,) + t[axis + 1 :])
 
 
 @dataclass(frozen=True)
@@ -226,8 +222,9 @@ class Constant[V]:
     ) -> V:
         if t[self.axis] != 0:
             return self.group.identity()
-        inner_t = tuple(x for i, x in enumerate(t) if i != self.axis)
-        return Get[V]().compute(inner_t, reads, ctx)
+        (read,) = reads
+        axis = self.axis
+        return read(t[:axis] + t[axis + 1 :])
 
 
 @dataclass(frozen=True)
@@ -237,14 +234,20 @@ class Foldl[V]:
     ``group.identity()`` (via :class:`Prev`) and the recurrence
     terminates with ``op(input(t_axis=0), identity)``.
 
-    Implementation is the literal composition ``ZipWith(op)(input,
-    Delay(self, axis))``. Closed in ``V``. Carries its own group for
-    the embedded :class:`Prev`.
+    The composition is ``ZipWith(op)(input, Delay(self, axis))``; the
+    embedded :class:`Prev` is built once at rule-construction time
+    (``compute`` runs once per uncached cell — no per-call helper
+    objects). Closed in ``V``. Carries its own group for the embedded
+    :class:`Prev`.
     """
 
     axis: int
     op: Callable[[V, V], V]
     group: AbelianGroupOperation[V]
+    _delay: Prev[V] = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "_delay", Prev(axis=self.axis, group=self.group))
 
     def compute(
         self,
@@ -253,9 +256,7 @@ class Foldl[V]:
         ctx: ComputeCtx,
     ) -> V:
         read_input, read_self = reads
-        delay = Prev[V](axis=self.axis, group=self.group)
-        read_delayed_self = partial(delay.compute, reads=(read_self,), ctx=ctx)
-        return ZipWith[V, V, V](op=self.op).compute(t, (read_input, read_delayed_self), ctx)
+        return self.op(read_input(t), self._delay.compute(t, (read_self,), ctx))
 
 
 @dataclass(frozen=True)
@@ -269,6 +270,10 @@ class Sum[V]:
 
     axis: int
     group: AbelianGroupOperation[V]
+    _foldl: Foldl[V] = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "_foldl", Foldl(axis=self.axis, op=self.group.add, group=self.group))
 
     def compute(
         self,
@@ -276,7 +281,7 @@ class Sum[V]:
         reads: tuple[Callable[[Time], V], Callable[[Time], V]],
         ctx: ComputeCtx,
     ) -> V:
-        return Foldl[V](axis=self.axis, op=self.group.add, group=self.group).compute(t, reads, ctx)
+        return self._foldl.compute(t, reads, ctx)
 
 
 @dataclass(frozen=True)
@@ -286,12 +291,18 @@ class Diff[V]:
     Composition: ``ZipWith(add)`` over the input read and
     ``Map(neg) ∘ Prev(input, axis)``. The single input reader is
     consumed twice. Once directly, once through the Delay+neg path.
+    The embedded :class:`Prev` is built once at rule-construction
+    time; ``compute`` applies ``add``/``neg`` directly.
 
     Reads: ``(input,)``. No self-edge.
     """
 
     axis: int
     group: AbelianGroupOperation[V]
+    _delay: Prev[V] = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "_delay", Prev(axis=self.axis, group=self.group))
 
     def compute(
         self,
@@ -300,8 +311,4 @@ class Diff[V]:
         ctx: ComputeCtx,
     ) -> V:
         (read,) = reads
-        delay = Prev[V](axis=self.axis, group=self.group)
-        read_delayed = partial(delay.compute, reads=(read,), ctx=ctx)
-        neg_lift = Map[V, V](f=self.group.neg)
-        read_neg_delayed = partial(neg_lift.compute, reads=(read_delayed,), ctx=ctx)
-        return ZipWith[V, V, V](op=self.group.add).compute(t, (read, read_neg_delayed), ctx)
+        return self.group.add(read(t), self.group.neg(self._delay.compute(t, (read,), ctx)))

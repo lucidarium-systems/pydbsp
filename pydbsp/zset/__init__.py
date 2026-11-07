@@ -60,17 +60,41 @@ class ZSetAddition[T](AbelianGroupOperation[ZSet[T]]):
         """
         Adds two Z-sets by summing weights of common elements.
         Elements with resulting zero weight are removed.
-        """
-        result = a.inner | b.inner
 
-        for k, v in b.inner.items():
-            if k in a.inner:
-                new_weight = a.inner[k] + v
+        Identity operands are returned by reference (results are
+        read-only by convention, so sharing is safe). The merge is
+        oriented so the smaller operand is iterated: a
+        cumulative-plus-delta add (the ``Foldl``/``Sum`` recurrence,
+        which passes the cumulative as ``b``) costs one C-level copy
+        of the large side plus ``O(|delta|)`` dict operations,
+        instead of a Python-level walk over the cumulative.
+        """
+        ai, bi = a.inner, b.inner
+        if not bi:
+            return a
+        if not ai:
+            return b
+        if len(ai) < len(bi):
+            ai, bi = bi, ai
+        if len(bi) * 8 >= len(ai):
+            # Comparable sizes: C-speed union, then correct overlaps.
+            result = ai | bi
+            for k, v in bi.items():
+                if k in ai:
+                    new_weight = ai[k] + v
+                    if new_weight == 0:
+                        del result[k]
+                    else:
+                        result[k] = new_weight
+        else:
+            # Skewed sizes: fork the big side, fold in the small one.
+            result = dict(ai)
+            for k, v in bi.items():
+                new_weight = result.get(k, 0) + v
                 if new_weight == 0:
-                    del result[k]
+                    result.pop(k, None)
                 else:
                     result[k] = new_weight
-
         return ZSet(result)
 
     def neg(self, a: ZSet[T]) -> ZSet[T]:
