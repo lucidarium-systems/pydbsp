@@ -1,8 +1,7 @@
-"""Stratified-negation Datalog: helpers, body operator, and driver.
+"""Stratified-negation Datalog: 3-D primitives, body operator, and drivers.
 
-The body operates on a ``(outer, stratum, inner)`` lattice with
-primitives that are the 3-D analog of the 2-D bilinear / distinct
-operators in :mod:`pydbsp.relational_operators`:
+The 3-D primitives are the ``(outer, ·, inner)`` analog of the 2-D
+bilinear / distinct operators in :mod:`pydbsp.relational_operators`:
 
 * :class:`DeltaLiftedDeltaLiftedDeltaLiftedJoin` — 8-term bilinear
   join (the 3-D extension of the 2-D 4-term bilinear).
@@ -10,17 +9,20 @@ operators in :mod:`pydbsp.relational_operators`:
   ``Differentiate(H(z⁻¹ I s, I s))``.
 
 The ``Lift1`` / ``Lift2`` value-layer wrappers are arity-agnostic and
-carry over unchanged.
+carry over unchanged. :class:`IncrementalDatalogBodyWithNegation` is the
+negation-aware body built from them; the alternating drivers run it.
 
-This module exposes :class:`IncrementalDatalogBodyWithNegation`, the
-negation-aware Datalog body, plus the stratified driver
-:class:`IncrementalDatalogStratified` that wraps user rules with
-monotone ``stratum_ready`` guards derived from the running level
-subgraph and seeds those readiness facts into the body's feedback
-state at the physical inner coordinate where each stratum starts.
+Drivers:
 
-The value-layer helpers below feed the in-circuit level subgraph via
-``Lift1`` (per-rule extractors) and the guard rewriter via ``Lift2``."""
+* :class:`IndexedDatalog`, :class:`IndexedDatalogWithNegation`,
+  :class:`DatalogWithNegation` — 2-D; with negation, correct on programs
+  tight below negation.
+* :class:`DatalogStratifiedComposition` — one 2-D fixpoint per stratum.
+* :class:`IncrementalDatalogStratified` and its indexed subclass —
+  ``stratSpec`` of ``V3/StratifiedCircuit.lean``: the 2-D body at
+  ``inner_axis=2``, lifted pointwise over the stratum axis.
+* :class:`DatalogAlternating`, :class:`IncrementalDatalogAlternating` —
+  the alternating fixpoint as one 3-D circuit."""
 
 from __future__ import annotations
 
@@ -33,13 +35,9 @@ from pydbsp.compute import ComputeCtx
 from pydbsp.core import Antichain, dbsp_time
 from pydbsp.evaluate import Evaluator
 from pydbsp.indexed_relational_operators import (
-    IndexedDeltaLiftedDeltaLiftedDeltaLiftedJoin,
     IndexedIncrementalDatalogBody,
     IndexedIncrementalDatalogWithNegationBody,
-    LiftGroupBy,
-    LiftIndex,
 )
-from pydbsp.indexed_zset import IndexedZSetAddition
 from pydbsp.operator import (
     CoreDelay,
     CoreDifferentiate,
@@ -59,116 +57,9 @@ from pydbsp.zset import ZSet, ZSetAddition
 # ---- Value-layer helpers ---------------------------------------------------
 
 
-def _extract_head_preds(program: ZSet[dlg.Rule]) -> ZSet[tuple[str]]:
-    """Per-rule head-predicate extractor. Each rule contributes a
-    single ``(head_pred,)`` 1-tuple at the rule's weight. Designed as
-    a value-level Lift1 input — for the in-circuit level Datalog,
-    these are the ``head(P)`` facts from rule 1."""
-    out: dict[tuple[str], int] = {}
-    for rule, w in program.inner.items():
-        if w == 0:
-            continue
-        key = (rule[0][0],)
-        out[key] = out.get(key, 0) + w
-    return ZSet({k: v for k, v in out.items() if v != 0})
-
-
-def _extract_pos_dep_pairs(
-    program: ZSet[dlg.Rule],
-) -> ZSet[tuple[str, str]]:
-    """Per-rule positive-dep edges. For each rule with head ``P`` and
-    each positive body atom whose predicate is ``Q``, emit ``(P, Q)``.
-    Weight is the rule's weight, summed across rules contributing the
-    same edge."""
-    out: dict[tuple[str, str], int] = {}
-    for rule, w in program.inner.items():
-        if w == 0:
-            continue
-        head_pred = rule[0][0]
-        for atom in rule[1:]:
-            body_pred = atom[0]
-            if body_pred.startswith("!") or body_pred in dlg.INTERPRETED:
-                continue  # interpreted predicates are guards, not relations → no dep edge
-            key = (head_pred, body_pred)
-            out[key] = out.get(key, 0) + w
-    return ZSet({k: v for k, v in out.items() if v != 0})
-
-
-def _extract_neg_dep_pairs(
-    program: ZSet[dlg.Rule],
-) -> ZSet[tuple[str, str]]:
-    """Per-rule negative-dep edges. For each rule with head ``P`` and
-    each negated body atom ``!Q``, emit ``(P, Q)``."""
-    out: dict[tuple[str, str], int] = {}
-    for rule, w in program.inner.items():
-        if w == 0:
-            continue
-        head_pred = rule[0][0]
-        for atom in rule[1:]:
-            body_pred = atom[0]
-            if not body_pred.startswith("!"):
-                continue
-            key = (head_pred, body_pred[1:])
-            out[key] = out.get(key, 0) + w
-    return ZSet({k: v for k, v in out.items() if v != 0})
-
-
-_STRATUM_READY_PRED = "stratum_ready"
-
-
-def _guard_program_with_levels(
-    program: ZSet[dlg.Rule],
-    levels: ZSet[tuple[tuple[str], int]],
-) -> ZSet[dlg.Rule]:
-    """Per-cell ``Lift2`` join: prepend a stratum-readiness guard to
-    each rule according to its head's current effective level.
-    ``levels`` is the running level subgraph's
-    ``effective_level_out`` cumulative — entries ``((P,), max_level)``.
-    A rule whose head has no level entry yet defaults to level 0
-    (e.g., the very first push, before the level subgraph has had a
-    chance to propagate).
-
-    Level changes become ordinary signed rule-value changes after this
-    function is composed with ``Differentiate``: the old guarded rule is
-    retracted and the new guarded rule is inserted."""
-    level_map: dict[str, int] = {}
-    for (pred_key, lvl), w in levels.inner.items():
-        if w <= 0:
-            continue
-        pred = pred_key[0]
-        prior = level_map.get(pred)
-        if prior is None or lvl > prior:
-            level_map[pred] = lvl
-    out: dict[dlg.Rule, int] = {}
-    for rule, w in program.inner.items():
-        if w == 0:
-            continue
-        head_pred = rule[0][0]
-        level = level_map.get(head_pred, 0)
-        key = (
-            rule[0],
-            (_STRATUM_READY_PRED, (level - 1,)),
-            *rule[1:],
-        )
-        out[key] = out.get(key, 0) + w
-    return ZSet({k: v for k, v in out.items() if v != 0})
-
-
-def _stratum_ready_delta(stratum: int) -> ZSet[dlg.Fact]:
-    """Monotone readiness control fact delta for ``stratum``.
-
-    The cumulative fact set at stratum ``s`` contains every readiness
-    fact up to ``stratum_ready(s - 1)``. Keeping lower readiness facts
-    active preserves lower-stratum derived facts as the body advances
-    to higher strata; higher-stratum rules still cannot fire early
-    because their own readiness fact has not been inserted yet."""
-    current = (_STRATUM_READY_PRED, (stratum - 1,))
-    return ZSet({current: 1})
-
-
 def _without_internal_facts(z: ZSet[dlg.Fact]) -> ZSet[dlg.Fact]:
-    """Filter internal control facts out of public Datalog output."""
-    return ZSet({fact: w for fact, w in z.inner.items() if fact[0] != _STRATUM_READY_PRED and w != 0})
+    """Drop zero-weight entries from public Datalog output."""
+    return ZSet({fact: w for fact, w in z.inner.items() if w != 0})
 
 
 def _tainted_positions(program: ZSet[dlg.Rule]) -> set[tuple[str, int]]:
@@ -716,183 +607,6 @@ class IncrementalDatalogBodyWithNegation(Operator):
         ](op=lambda a, b: (a, b)).connect(circuit, (next_facts, next_rewrites))
 
 
-@dataclass(frozen=True)
-class IndexedIncrementalDatalogBodyWithNegation(Operator):
-    """SORT-MERGE-INDEXED 3-D (outer, stratum, inner) negation body — the indexed
-    analog of :class:`IncrementalDatalogBodyWithNegation`. Byte-for-byte the same
-    body, with every :class:`DeltaLiftedDeltaLiftedDeltaLiftedJoin` replaced by an
-    :class:`~pydbsp.indexed_relational_operators.IndexedDeltaLiftedDeltaLiftedDeltaLiftedJoin`
-    (operands pre-indexed via :class:`LiftIndex`), exactly as the 2-D
-    :class:`~pydbsp.indexed_relational_operators.IndexedIncrementalDatalogWithNegationBody`
-    indexes the 2-D plain body. Produces the SAME ``(facts_diff, rewrites_diff)`` IDB;
-    only the join cost changes (O(matching keys) vs O(|left|·|right|)).
-
-    ``inputs = (edb_1d, program_3d, state_facts_3d, state_rewrites_3d, seed_1d)``."""
-
-    fact_group: ZSetAddition[dlg.Fact]
-    rule_group: ZSetAddition[dlg.Rule]
-    rewrite_group: ZSetAddition[dlg.ProvenanceIndexedRewrite]
-    signal_group: ZSetAddition[dlg.Signal]
-    ext_dir_group: ZSetAddition[dlg.ExtendedDirection]
-    jorder_group: ZSetAddition[tuple[str, dlg.ColumnReference]]
-    gatekeep_group: ZSetAddition[dlg.IndexedGatekeepEntry]
-    indexed_fact_group: ZSetAddition[dlg.IndexedFact]
-
-    def connect(self, circuit: Circuit[Time], inputs: tuple[NodeId, ...]) -> NodeId:
-        if len(inputs) != 5:
-            raise ValueError(f"IndexedIncrementalDatalogBodyWithNegation takes 5 inputs; got {len(inputs)}")
-        edb_1d, program_3d, state_facts_3d, state_rewrites_3d, seed_1d = inputs
-
-        edb_2d = LiftStreamIntroduction[ZSet[dlg.Fact]](group=self.fact_group).connect(circuit, (edb_1d,))
-        edb_3d = LiftStreamIntroduction[ZSet[dlg.Fact]](group=self.fact_group).connect(circuit, (edb_2d,))
-        seed_2d = LiftStreamIntroduction[ZSet[dlg.ProvenanceIndexedRewrite]](group=self.rewrite_group).connect(circuit, (seed_1d,))
-        seed_3d = LiftStreamIntroduction[ZSet[dlg.ProvenanceIndexedRewrite]](group=self.rewrite_group).connect(circuit, (seed_2d,))
-
-        delayed_facts = CoreDelay[ZSet[dlg.Fact]](axis=2, group=self.fact_group).connect(circuit, (state_facts_3d,))
-        delayed_rewrites = CoreDelay[ZSet[dlg.ProvenanceIndexedRewrite]](axis=2, group=self.rewrite_group).connect(circuit, (state_rewrites_3d,))
-
-        sig_3d = Lift1[ZSet[dlg.Rule], ZSet[dlg.Signal]](f=dlg.sig).connect(circuit, (program_3d,))
-        ext_dir_3d = Lift1[ZSet[dlg.Rule], ZSet[dlg.ExtendedDirection]](f=dlg.ext_dir).connect(circuit, (program_3d,))
-        jorder_3d = Lift1[ZSet[dlg.Rule], ZSet[tuple[str, dlg.ColumnReference]]](f=dlg.jorder).connect(circuit, (program_3d,))
-
-        # gatekeep: delayed_rewrites ⋈ ext_dir on provenance
-        indexed_rewrites = LiftIndex[dlg.ProvenanceIndexedRewrite, dlg.Provenance](indexer=lambda rw: rw[0]).connect(circuit, (delayed_rewrites,))
-        indexed_ext_dir = LiftIndex[dlg.ExtendedDirection, dlg.Provenance](indexer=lambda ed: ed[0]).connect(circuit, (ext_dir_3d,))
-        rewrite_idx_group = IndexedZSetAddition[dlg.Provenance, dlg.ProvenanceIndexedRewrite](self.rewrite_group, lambda rw: rw[0])
-        ext_dir_idx_group = IndexedZSetAddition[dlg.Provenance, dlg.ExtendedDirection](self.ext_dir_group, lambda ed: ed[0])
-        gatekeep = IndexedDeltaLiftedDeltaLiftedDeltaLiftedJoin[
-            dlg.Provenance, dlg.ProvenanceIndexedRewrite, dlg.ExtendedDirection, dlg.IndexedGatekeepEntry
-        ](
-            proj=lambda _k, l, r: (r[1], r[2], l[1], r[3]),
-            group_a=rewrite_idx_group, group_b=ext_dir_idx_group, out_group=self.gatekeep_group,
-        ).connect(circuit, (indexed_rewrites, indexed_ext_dir))
-
-        # facts ⋈ jorder on predicate → indexed (column-ref-keyed) facts
-        indexed_facts_by_pred = LiftIndex[dlg.Fact, str](indexer=lambda f: f[0]).connect(circuit, (delayed_facts,))
-        indexed_jorder_by_pred = LiftIndex[tuple[str, dlg.ColumnReference], str](indexer=lambda j: j[0]).connect(circuit, (jorder_3d,))
-        fact_pred_group = IndexedZSetAddition[str, dlg.Fact](self.fact_group, lambda f: f[0])
-        jorder_pred_group = IndexedZSetAddition[str, tuple[str, dlg.ColumnReference]](self.jorder_group, lambda j: j[0])
-        indexed_facts_raw = IndexedDeltaLiftedDeltaLiftedDeltaLiftedJoin[
-            str, dlg.Fact, tuple[str, dlg.ColumnReference], dlg.IndexedFact
-        ](
-            proj=lambda _k, fact, jo: dlg._index_fact(jo[1], fact),
-            group_a=fact_pred_group, group_b=jorder_pred_group, out_group=self.indexed_fact_group,
-        ).connect(circuit, (indexed_facts_by_pred, indexed_jorder_by_pred))
-        distinct_indexed_facts = DeltaLiftedDeltaLiftedDeltaLiftedDistinct[dlg.IndexedFact](
-            inner_group=self.indexed_fact_group
-        ).connect(circuit, (indexed_facts_raw,))
-
-        positive_atoms = Lift1[ZSet[dlg.IndexedGatekeepEntry], ZSet[dlg.IndexedGatekeepEntry]](
-            f=lambda z: ZSet(
-                {gk: w for gk, w in z.inner.items() if gk[1] is None or ("!" not in gk[1][0] and gk[1][0] not in dlg.INTERPRETED)}
-            )
-        ).connect(circuit, (gatekeep,))
-        negative_atoms = Lift1[ZSet[dlg.IndexedGatekeepEntry], ZSet[dlg.IndexedGatekeepEntry]](
-            f=lambda z: ZSet({gk: w for gk, w in z.inner.items() if not (gk[1] is None or "!" not in gk[1][0])})
-        ).connect(circuit, (gatekeep,))
-        # interpreted (built-in) atoms — stateless guard, projected to the unchanged rewrite.
-        interp_proj = Lift1[ZSet[dlg.IndexedGatekeepEntry], ZSet[dlg.ProvenanceIndexedRewrite]](
-            f=lambda z: ZSet(
-                {
-                    (gk[0], gk[2]): w
-                    for gk, w in z.inner.items()
-                    if gk[1] is not None and gk[1][0] in dlg.INTERPRETED and dlg.eval_interpreted(gk[1], gk[2])
-                }
-            )
-        ).connect(circuit, (gatekeep,))
-
-        gatekeep_idx_group = IndexedZSetAddition[dlg.JoinKey, dlg.IndexedGatekeepEntry](self.gatekeep_group, dlg._gatekeep_join_key)
-        indexed_fact_idx_group = IndexedZSetAddition[dlg.JoinKey, dlg.IndexedFact](self.indexed_fact_group, lambda ifact: ifact[0])
-        keyed_positive = LiftIndex[dlg.IndexedGatekeepEntry, dlg.JoinKey](indexer=dlg._gatekeep_join_key).connect(circuit, (positive_atoms,))
-        keyed_facts = LiftIndex[dlg.IndexedFact, dlg.JoinKey](indexer=lambda ifact: ifact[0]).connect(circuit, (distinct_indexed_facts,))
-
-        product = IndexedDeltaLiftedDeltaLiftedDeltaLiftedJoin[
-            dlg.JoinKey, dlg.IndexedGatekeepEntry, dlg.IndexedFact, dlg.ProvenanceIndexedRewrite
-        ](
-            proj=dlg._indexed_product_proj,
-            group_a=gatekeep_idx_group, group_b=indexed_fact_idx_group, out_group=self.rewrite_group,
-        ).connect(circuit, (keyed_positive, keyed_facts))
-
-        proj = Lift1[ZSet[dlg.IndexedGatekeepEntry], ZSet[dlg.ProvenanceIndexedRewrite]](
-            f=lambda z: ZSet({(gk[0], gk[2]): w for gk, w in z.inner.items()})
-        ).connect(circuit, (negative_atoms,))
-
-        keyed_negative = LiftIndex[dlg.IndexedGatekeepEntry, dlg.JoinKey](indexer=dlg._gatekeep_join_key).connect(circuit, (negative_atoms,))
-        anti_product = IndexedDeltaLiftedDeltaLiftedDeltaLiftedJoin[
-            dlg.JoinKey, dlg.IndexedGatekeepEntry, dlg.IndexedFact, dlg.ProvenanceIndexedRewrite
-        ](
-            proj=lambda _k, gk, _ifact: (gk[0], gk[2]),
-            group_a=gatekeep_idx_group, group_b=indexed_fact_idx_group, out_group=self.rewrite_group,
-        ).connect(circuit, (keyed_negative, keyed_facts))
-
-        # final_product = product + proj − anti_product
-        product_plus_proj = Lift2[ZSet[dlg.ProvenanceIndexedRewrite], ZSet[dlg.ProvenanceIndexedRewrite], ZSet[dlg.ProvenanceIndexedRewrite]](
-            op=self.rewrite_group.add
-        ).connect(circuit, (product, proj))
-        neg_anti = Lift1[ZSet[dlg.ProvenanceIndexedRewrite], ZSet[dlg.ProvenanceIndexedRewrite]](f=self.rewrite_group.neg).connect(circuit, (anti_product,))
-        final_product_neg = Lift2[ZSet[dlg.ProvenanceIndexedRewrite], ZSet[dlg.ProvenanceIndexedRewrite], ZSet[dlg.ProvenanceIndexedRewrite]](
-            op=self.rewrite_group.add
-        ).connect(circuit, (product_plus_proj, neg_anti))
-        # final_product = product + proj − anti_product + interp_proj
-        final_product = Lift2[ZSet[dlg.ProvenanceIndexedRewrite], ZSet[dlg.ProvenanceIndexedRewrite], ZSet[dlg.ProvenanceIndexedRewrite]](
-            op=self.rewrite_group.add
-        ).connect(circuit, (final_product_neg, interp_proj))
-
-        # ground: final_product ⋈ sig on provenance → facts
-        indexed_final_product = LiftIndex[dlg.ProvenanceIndexedRewrite, dlg.Provenance](indexer=lambda r: r[0]).connect(circuit, (final_product,))
-        indexed_sig = LiftIndex[dlg.Signal, dlg.Provenance](indexer=lambda s: s[0]).connect(circuit, (sig_3d,))
-        sig_idx_group = IndexedZSetAddition[dlg.Provenance, dlg.Signal](self.signal_group, lambda s: s[0])
-        ground = IndexedDeltaLiftedDeltaLiftedDeltaLiftedJoin[dlg.Provenance, dlg.ProvenanceIndexedRewrite, dlg.Signal, dlg.Fact](
-            proj=lambda _k, l, r: l[1].apply(r[1]),
-            group_a=rewrite_idx_group, group_b=sig_idx_group, out_group=self.fact_group,
-        ).connect(circuit, (indexed_final_product, indexed_sig))
-
-        ground_plus_edb = Lift2[ZSet[dlg.Fact], ZSet[dlg.Fact], ZSet[dlg.Fact]](op=self.fact_group.add).connect(circuit, (ground, edb_3d))
-        next_facts = DeltaLiftedDeltaLiftedDeltaLiftedDistinct[dlg.Fact](inner_group=self.fact_group).connect(circuit, (ground_plus_edb,))
-
-        final_plus_seed = Lift2[ZSet[dlg.ProvenanceIndexedRewrite], ZSet[dlg.ProvenanceIndexedRewrite], ZSet[dlg.ProvenanceIndexedRewrite]](
-            op=self.rewrite_group.add
-        ).connect(circuit, (final_product, seed_3d))
-        next_rewrites = DeltaLiftedDeltaLiftedDeltaLiftedDistinct[dlg.ProvenanceIndexedRewrite](inner_group=self.rewrite_group).connect(circuit, (final_plus_seed,))
-
-        return Lift2[ZSet[dlg.Fact], ZSet[dlg.ProvenanceIndexedRewrite], tuple[ZSet[dlg.Fact], ZSet[dlg.ProvenanceIndexedRewrite]]](
-            op=lambda a, b: (a, b)
-        ).connect(circuit, (next_facts, next_rewrites))
-
-
-LevelAtLeast = tuple[str, int]
-"""A ``(predicate, level)`` pair. ``level_at_least(P, k)`` semantics:
-P's stratum is *at least* k, derived from the dependency graph."""
-
-EffectiveLevel = tuple[tuple[str], int]
-"""``(predicate_key, max_level)`` after grouping by predicate. The key
-is wrapped in a 1-tuple because :class:`LiftIndex` keys are arbitrary
-tuples — keeps the type uniform."""
-
-
-def _max_inner_before_outer(
-    frontier: Antichain[Time],
-    outer: int,
-    stratum: int,
-) -> int:
-    """Largest inner coordinate covered by ``frontier`` at any prior
-    outer for the given ``stratum``. An antichain point at a higher
-    stratum also covers lower strata in the down-set, so it contributes
-    to the bound."""
-    if frontier.is_universal:
-        return -1
-    out = -1
-    for elt in frontier.elements:
-        if len(elt) < 3 or not isinstance(elt[0], int) or elt[0] >= outer:
-            continue
-        if elt[1] < stratum:
-            continue
-        inner = elt[2]
-        if isinstance(inner, int) and inner > out:
-            out = inner
-    return out
-
-
 def _frontier_max(frontier: Antichain[Time], axis: int) -> int:
     """Largest coordinate on ``axis`` covered anywhere by ``frontier``'s
     down-set (= the max over its maximal elements)."""
@@ -908,535 +622,223 @@ def _frontier_max(frontier: Antichain[Time], axis: int) -> int:
     return out
 
 
-def _connect_running_level_3d(
-    e: Evaluator[Time],
-    program_1d: NodeId,
-    state_level_3d: NodeId,
-    level_group: ZSetAddition[LevelAtLeast],
-) -> tuple[NodeId, NodeId, NodeId]:
-    """Wire the running stratification subgraph on the main 3-D
-    ``(outer, stratum, inner)`` lattice.
-
-    ``level_at_least_out`` is the ordinary feedback delta. A value
-    ``(P, k)`` means the circuit has established that predicate ``P``
-    has effective level at least ``k``. The stratum axis carries the
-    negative-depth wave: rule 3 reads level state from the prior
-    stratum via ``Delay(axis=1)``.
-
-    ``level_next_stratum_out`` is not fed back. It is a driver-visible
-    lookahead saying "the current stratum has enough information to
-    produce work in the next stratum." This avoids computing a final
-    Python-side level map before deciding to clock stratum ``s + 1``.
-    """
-    head_group = ZSetAddition[tuple[str]]()
-    edge_group = ZSetAddition[tuple[str, str]]()
-
-    head_1d = Lift1[ZSet[dlg.Rule], ZSet[tuple[str]]](
-        f=_extract_head_preds,
-    ).connect(e.circuit, (program_1d,))
-    pos_dep_1d = Lift1[ZSet[dlg.Rule], ZSet[tuple[str, str]]](
-        f=_extract_pos_dep_pairs,
-    ).connect(e.circuit, (program_1d,))
-    neg_dep_1d = Lift1[ZSet[dlg.Rule], ZSet[tuple[str, str]]](
-        f=_extract_neg_dep_pairs,
-    ).connect(e.circuit, (program_1d,))
-
-    head_2d = LiftStreamIntroduction[ZSet[tuple[str]]](
-        group=head_group,
-    ).connect(e.circuit, (head_1d,))
-    head_3d = LiftStreamIntroduction[ZSet[tuple[str]]](
-        group=head_group,
-    ).connect(e.circuit, (head_2d,))
-    pos_dep_2d = LiftStreamIntroduction[ZSet[tuple[str, str]]](
-        group=edge_group,
-    ).connect(e.circuit, (pos_dep_1d,))
-    pos_dep_3d = LiftStreamIntroduction[ZSet[tuple[str, str]]](
-        group=edge_group,
-    ).connect(e.circuit, (pos_dep_2d,))
-    neg_dep_2d = LiftStreamIntroduction[ZSet[tuple[str, str]]](
-        group=edge_group,
-    ).connect(e.circuit, (neg_dep_1d,))
-    neg_dep_3d = LiftStreamIntroduction[ZSet[tuple[str, str]]](
-        group=edge_group,
-    ).connect(e.circuit, (neg_dep_2d,))
-
-    within_stratum_level = CoreDelay[ZSet[LevelAtLeast]](
-        axis=2,
-        group=level_group,
-    ).connect(e.circuit, (state_level_3d,))
-    prior_stratum_level = CoreDelay[ZSet[LevelAtLeast]](
-        axis=1,
-        group=level_group,
-    ).connect(e.circuit, (state_level_3d,))
-
-    contrib_1 = Lift1[ZSet[tuple[str]], ZSet[LevelAtLeast]](
-        f=lambda heads: ZSet({(head[0], 0): w for head, w in heads.inner.items()}),
-    ).connect(e.circuit, (head_3d,))
-
-    contrib_2 = DeltaLiftedDeltaLiftedDeltaLiftedJoin[
-        tuple[str, str],
-        LevelAtLeast,
-        LevelAtLeast,
-    ](
-        pred=lambda pd, lvl: pd[1] == lvl[0],
-        proj=lambda pd, lvl: (pd[0], lvl[1]),
-        group_a=edge_group,
-        group_b=level_group,
-        out_group=level_group,
-    ).connect(e.circuit, (pos_dep_3d, within_stratum_level))
-
-    contrib_3 = DeltaLiftedDeltaLiftedDeltaLiftedJoin[
-        tuple[str, str],
-        LevelAtLeast,
-        LevelAtLeast,
-    ](
-        pred=lambda nd, lvl: nd[1] == lvl[0],
-        proj=lambda nd, lvl: (nd[0], lvl[1] + 1),
-        group_a=edge_group,
-        group_b=level_group,
-        out_group=level_group,
-    ).connect(e.circuit, (neg_dep_3d, prior_stratum_level))
-
-    sum_12 = Lift2[
-        ZSet[LevelAtLeast],
-        ZSet[LevelAtLeast],
-        ZSet[LevelAtLeast],
-    ](op=level_group.add).connect(e.circuit, (contrib_1, contrib_2))
-    total = Lift2[
-        ZSet[LevelAtLeast],
-        ZSet[LevelAtLeast],
-        ZSet[LevelAtLeast],
-    ](op=level_group.add).connect(e.circuit, (sum_12, contrib_3))
-    level_at_least_out = DeltaLiftedDeltaLiftedDeltaLiftedDistinct[LevelAtLeast](inner_group=level_group).connect(
-        e.circuit, (total,)
-    )
-
-    # Feed-forward lookahead: if a level fact produced in this stratum
-    # can traverse a negative edge, the predicate's effective level is
-    # already higher than the current stratum. This is not fed back as
-    # same-stratum level state; it only annotates the running guarded
-    # program and tells the driver to clock the next stratum.
-    level_next_stratum_out = DeltaLiftedDeltaLiftedDeltaLiftedJoin[
-        tuple[str, str],
-        LevelAtLeast,
-        LevelAtLeast,
-    ](
-        pred=lambda nd, lvl: nd[1] == lvl[0],
-        proj=lambda nd, lvl: (nd[0], lvl[1] + 1),
-        group_a=edge_group,
-        group_b=level_group,
-        out_group=level_group,
-    ).connect(e.circuit, (neg_dep_3d, level_at_least_out))
-
-    effective_level_delta = Lift2[
-        ZSet[LevelAtLeast],
-        ZSet[LevelAtLeast],
-        ZSet[LevelAtLeast],
-    ](op=level_group.add).connect(
-        e.circuit,
-        (level_at_least_out, level_next_stratum_out),
-    )
-
-    int_o = CoreIntegrate[ZSet[LevelAtLeast]](
-        axis=0,
-        group=level_group,
-    ).connect(e.circuit, (effective_level_delta,))
-    int_os = CoreIntegrate[ZSet[LevelAtLeast]](
-        axis=1,
-        group=level_group,
-    ).connect(e.circuit, (int_o,))
-    cum_level = CoreIntegrate[ZSet[LevelAtLeast]](
-        axis=2,
-        group=level_group,
-    ).connect(e.circuit, (int_os,))
-
-    indexed_cum = LiftIndex[LevelAtLeast, tuple[str]](
-        indexer=lambda pk: (pk[0],),
-    ).connect(e.circuit, (cum_level,))
-    effective_level_out = LiftGroupBy[LevelAtLeast, tuple[str], int](
-        aggregate=lambda items: max(p_k[1] for p_k, _ in items),
-    ).connect(e.circuit, (indexed_cum,))
-
-    return (
-        level_at_least_out,
-        level_next_stratum_out,
-        effective_level_out,
-    )
-
-
-def _build_stratified_body_circuit(indexed: bool = False) -> tuple[
-    Evaluator[Time],
-    NodeId,  # edb_1d
-    NodeId,  # program_1d (driver pushes raw rule deltas)
-    NodeId,  # state_level_3d
-    NodeId,  # state_facts_3d
-    NodeId,  # state_rewrites_3d
-    NodeId,  # seed_1d
-    NodeId,  # level_at_least_out
-    NodeId,  # level_next_stratum_out
-    NodeId,  # guarded_delta_3d
-    NodeId,  # body_out (facts + rewrites pair)
-]:
-    """Persistent 3-D body circuit using
-    :class:`IncrementalDatalogBodyWithNegation`. The body rewrites
-    each rule with a stratum-readiness guard derived from the 3-D
-    running level subgraph, then feeds guarded-rule deltas to the main
-    Datalog body. Monotone ``stratum_ready`` facts are seeded into the
-    fact-state feedback at each stratum's physical inner start."""
-    fact_group = ZSetAddition[dlg.Fact]()
-    rule_group = ZSetAddition[dlg.Rule]()
-    rewrite_group = ZSetAddition[dlg.ProvenanceIndexedRewrite]()
-    level_group = ZSetAddition[LevelAtLeast]()
-    e = Evaluator[Time](
-        circuit=Circuit[Time](),
-        storage=DictStorage(),
-        ctx=ComputeCtx(lattice=dbsp_time(3)),
-        group=fact_group,
-    )
-    edb_1d = Input[ZSet[dlg.Fact]](
-        frontier=Antichain(dbsp_time(1)),
-    ).connect(e.circuit, ())
-    program_1d = Input[ZSet[dlg.Rule]](
-        frontier=Antichain(dbsp_time(1)),
-    ).connect(e.circuit, ())
-    state_level_3d = Input[ZSet[LevelAtLeast]](
-        frontier=Antichain(dbsp_time(3)),
-    ).connect(e.circuit, ())
-    state_facts_3d = Input[ZSet[dlg.Fact]](
-        frontier=Antichain(dbsp_time(3)),
-    ).connect(e.circuit, ())
-    state_rewrites_3d = Input[ZSet[dlg.ProvenanceIndexedRewrite]](
-        frontier=Antichain(dbsp_time(3)),
-    ).connect(e.circuit, ())
-    seed_1d = Input[ZSet[dlg.ProvenanceIndexedRewrite]](
-        frontier=Antichain(dbsp_time(1)),
-    ).connect(e.circuit, ())
-
-    (
-        level_at_least_out,
-        level_next_stratum_out,
-        effective_level_3d,
-    ) = _connect_running_level_3d(
-        e,
-        program_1d,
-        state_level_3d,
-        level_group,
-    )
-
-    # Lift the raw 1-D rule stream to 3-D, integrate over all three
-    # axes to get the cumulative program, rewrite each rule with its
-    # readiness guard against the current effective-level snapshot,
-    # then differentiate back to a per-cell guarded-rule delta.
-    program_2d = LiftStreamIntroduction[ZSet[dlg.Rule]](
-        group=rule_group,
-    ).connect(e.circuit, (program_1d,))
-    program_3d = LiftStreamIntroduction[ZSet[dlg.Rule]](
-        group=rule_group,
-    ).connect(e.circuit, (program_2d,))
-    cum_program_o = CoreIntegrate[ZSet[dlg.Rule]](
-        axis=0,
-        group=rule_group,
-    ).connect(e.circuit, (program_3d,))
-    cum_program_os = CoreIntegrate[ZSet[dlg.Rule]](
-        axis=1,
-        group=rule_group,
-    ).connect(e.circuit, (cum_program_o,))
-    cum_program_3d = CoreIntegrate[ZSet[dlg.Rule]](
-        axis=2,
-        group=rule_group,
-    ).connect(e.circuit, (cum_program_os,))
-    guarded_cum_3d = Lift2[
-        ZSet[dlg.Rule],
-        ZSet[tuple[tuple[str], int]],
-        ZSet[dlg.Rule],
-    ](
-        op=_guard_program_with_levels,
-    ).connect(e.circuit, (cum_program_3d, effective_level_3d))
-    guarded_delta_i = CoreDifferentiate[ZSet[dlg.Rule]](
-        axis=2,
-        group=rule_group,
-    ).connect(e.circuit, (guarded_cum_3d,))
-    guarded_delta_si = CoreDifferentiate[ZSet[dlg.Rule]](
-        axis=1,
-        group=rule_group,
-    ).connect(e.circuit, (guarded_delta_i,))
-    guarded_delta_3d = CoreDifferentiate[ZSet[dlg.Rule]](
-        axis=0,
-        group=rule_group,
-    ).connect(e.circuit, (guarded_delta_si,))
-
-    if indexed:
-        # SORT-MERGE-indexed body — identical IDB, asymptotically faster joins.
-        body = IndexedIncrementalDatalogBodyWithNegation(
-            fact_group=fact_group,
-            rule_group=rule_group,
-            rewrite_group=rewrite_group,
-            signal_group=ZSetAddition[dlg.Signal](),
-            ext_dir_group=ZSetAddition[dlg.ExtendedDirection](),
-            jorder_group=ZSetAddition[tuple[str, dlg.ColumnReference]](),
-            gatekeep_group=ZSetAddition[dlg.IndexedGatekeepEntry](),
-            indexed_fact_group=ZSetAddition[dlg.IndexedFact](),
-        )
-    else:
-        body = IncrementalDatalogBodyWithNegation(
-            fact_group=fact_group,
-            rule_group=rule_group,
-            rewrite_group=rewrite_group,
-            signal_group=ZSetAddition[dlg.Signal](),
-            dir_group=ZSetAddition[dlg.Direction](),
-            gatekeep_group=(ZSetAddition[dlg.AtomWithSourceRewriteAndProvenance]()),
-        )
-    body_out = body.connect(
-        e.circuit,
-        (
-            edb_1d,
-            guarded_delta_3d,
-            state_facts_3d,
-            state_rewrites_3d,
-            seed_1d,
-        ),
-    )
-    return (
-        e,
-        edb_1d,
-        program_1d,
-        state_level_3d,
-        state_facts_3d,
-        state_rewrites_3d,
-        seed_1d,
-        level_at_least_out,
-        level_next_stratum_out,
-        guarded_delta_3d,
-        body_out,
-    )
-
-
 class IncrementalDatalogStratified:
-    """Stratified-negation Datalog evaluator. Truly incremental across
-    outer ticks w.r.t. both facts AND rules.
+    """``stratSpec`` of ``V3/StratifiedCircuit.lean``, on the
+    ``(outer, stratum, inner)`` lattice::
 
-    Construct, push rule and fact deltas, call :meth:`saturate` to
-    advance an outer tick. Each ``saturate()`` returns the running
-    cumulative derived-facts set. The fused 3-D circuit is built on
-    the first call and persists; subsequent calls only push the
-    per-outer deltas.
+        stratSpec = integral ; prepInject ; feedback2 stratumBody
 
-    Stratifiability is validated at each :meth:`push_rules` call —
-    a program that ever forms a cycle through negation raises
-    immediately. The stratum axis maintains running levels
-    incrementally, and the body circuit turns level changes into
-    signed guarded-rule value changes rather than moving raw rules
-    between timestamps."""
+    Three things make this the Lean circuit rather than merely an evaluator
+    that agrees with it.
 
-    _indexed: bool = False  # subclasses flip this to use the sort-merge body
+    *Keyed introduction.* ``placedRules S k`` is pushed at stratum cell ``k``:
+    a rule lives at the cell whose coordinate equals its head's level. No rule
+    is rewritten, and no control fact exists -- stratum ordering is the wiring.
 
-    def __init__(
-        self,
-        *,
-        max_inner: int = 1024,
-    ) -> None:
+    *Stratum delay.* ``eCell = delta0 E [k] + z^-1 cand [k]``. The base facts
+    reach ``(t, 0, 0)`` through the body's own introductions, and cell ``k``
+    opens on the summed store of cell ``k - 1``.
+
+    *Pointwise stratum lift.* The body is built at ``inner_axis=2``, so every
+    integrate and delay runs on axes 0 and 2 and nothing touches axis 1. The
+    join is the 4-term form lifted pointwise over the strata -- three lifts,
+    two incrementalizations -- not the 8-term join that incrementalizes all
+    three axes and lets strata mix.
+
+    ``stage(k)`` exposes the ``k``-th stage, which is what
+    ``stratSpec_computes`` is a statement about; ``saturate`` returns the
+    running cumulative, and every cell at or above the top level repeats the
+    full stratified model (``stratSpec_computes_full``).
+
+    No compaction is used: storage retains every cell across batches.
+    """
+
+    _indexed: bool = False
+
+    def __init__(self, *, max_inner: int = 1024) -> None:
         self._max_inner = max_inner
-        self._rule_group = ZSetAddition[dlg.Rule]()
         self._fact_group = ZSetAddition[dlg.Fact]()
-
+        self._rule_group = ZSetAddition[dlg.Rule]()
+        self._rewrite_group = ZSetAddition[dlg.ProvenanceIndexedRewrite]()
         self._cumulative_rules: ZSet[dlg.Rule] = ZSet({})
         self._pending_rules: ZSet[dlg.Rule] = ZSet({})
         self._pending_edb: ZSet[dlg.Fact] = ZSet({})
-
-        self._next_outer = 0
         self._cumulative_facts: ZSet[dlg.Fact] = ZSet({})
-        self._body_e: Evaluator[Time] | None = None
-        self._body_handles: tuple = ()
+        self._stages: list[ZSet[dlg.Fact]] = []
+        self._derived: list[ZSet[dlg.Fact]] = []
+        self._depth: list[int] = []
+        self._placed: list[ZSet[dlg.Rule]] = []
+        self._opened: list[ZSet[dlg.Fact]] = []
+        self._next_outer = 0
+        self._e: Evaluator[Time] | None = None
+        self._h: tuple = ()
 
-        # ``_scheduled_strata`` is monotone — it does not shrink when
-        # the current program's max level decreases, because historical
-        # upper-stratum state still needs cleanup retractions.
-        self._scheduled_strata: Antichain[Time] = Antichain(dbsp_time(1))
-        self._ready_strata: Antichain[Time] = Antichain(dbsp_time(1))
-
+    # -- inputs ------------------------------------------------------------
     def push_rules(self, rules: ZSet[dlg.Rule]) -> None:
-        """Accumulate a rule delta for the next :meth:`saturate`.
-        Validates stratifiability of the program-so-far each time;
-        raises if a cycle through negation appears."""
-        new_program = self._rule_group.add(
-            self._cumulative_rules,
-            self._rule_group.add(self._pending_rules, rules),
+        merged = self._rule_group.add(
+            self._cumulative_rules, self._rule_group.add(self._pending_rules, rules)
         )
-        _check_stratifiable(new_program)
-        dlg.check_interpreted_safety(new_program)
-        self._pending_rules = self._rule_group.add(
-            self._pending_rules,
-            rules,
-        )
+        _check_stratifiable(merged)
+        dlg.check_interpreted_safety(merged)
+        self._pending_rules = self._rule_group.add(self._pending_rules, rules)
 
     def push_facts(self, facts: ZSet[dlg.Fact]) -> None:
-        """Accumulate a fact delta for the next :meth:`saturate`."""
         self._pending_edb = self._fact_group.add(self._pending_edb, facts)
 
-    def _setup_circuits(self) -> None:
-        """Build the persistent 3-D circuit on the first
-        :meth:`saturate`. Pushes the rewrite-identity seed at outer 0."""
-        (
-            body_e,
-            edb_1d,
-            program_1d,
-            state_level_3d,
-            sf_3d,
-            sr_3d,
-            seed_1d,
-            level_out,
-            level_next,
-            guarded_delta_3d,
-            body_out,
-        ) = _build_stratified_body_circuit(indexed=self._indexed)
-        body_e.push(
-            seed_1d,
-            ZSet({(0, dlg._rewrite_monoid.identity()): 1}),
-        )
-        self._body_e = body_e
-        self._body_handles = (
-            edb_1d,
-            program_1d,
-            state_level_3d,
-            sf_3d,
-            sr_3d,
-            seed_1d,
-            level_out,
-            level_next,
-            guarded_delta_3d,
-            body_out,
+    # -- the circuit -------------------------------------------------------
+    def _build(self) -> None:
+        e = Evaluator(
+            circuit=Circuit(), storage=DictStorage(),
+            ctx=ComputeCtx(lattice=dbsp_time(3)), group=self._fact_group,
         )
 
+        def inp(axes: int) -> NodeId:
+            return Input(frontier=Antichain(dbsp_time(axes))).connect(e.circuit, ())
+
+        edb_1d, seed_1d = inp(1), inp(1)
+        program_3d, facts_3d, rewrites_3d = inp(3), inp(3), inp(3)
+        fg, rug, rwg = self._fact_group, self._rule_group, self._rewrite_group
+        if self._indexed:
+            body_op = IndexedIncrementalDatalogWithNegationBody(
+                fact_group=fg,
+                rule_group=rug,
+                rewrite_group=rwg,
+                signal_group=ZSetAddition(),
+                ext_dir_group=ZSetAddition(),
+                jorder_group=ZSetAddition(),
+                gatekeep_group=ZSetAddition(),
+                indexed_fact_group=ZSetAddition(),
+                inner_axis=2,
+            )
+        else:
+            body_op = IncrementalDatalogWithNegationBody(
+                fact_group=fg,
+                rule_group=rug,
+                rewrite_group=rwg,
+                signal_group=ZSetAddition(),
+                dir_group=ZSetAddition(),
+                gatekeep_group=ZSetAddition(),
+                inner_axis=2,
+            )
+        body = body_op.connect(e.circuit, (edb_1d, program_3d, facts_3d, rewrites_3d, seed_1d))
+        e.push(seed_1d, ZSet({(0, dlg._rewrite_monoid.identity()): 1}))
+        self._e = e
+        self._h = (edb_1d, program_3d, facts_3d, rewrites_3d, body)
+
+    # -- the stratum loop --------------------------------------------------
     def saturate(self) -> ZSet[dlg.Fact]:
-        """Advance one outer tick. Push pending rule + EDB deltas;
-        walk the stratum axis while the running level subgraph exposes
-        work, drive the shared inner loop per stratum, accumulate the
-        outer-delta, and return the running cumulative."""
-        if self._body_e is None:
-            self._setup_circuits()
-        assert self._body_e is not None
+        if self._e is None:
+            self._build()
+        e = self._e
+        assert e is not None
+        edb_1d, program_3d, facts_3d, rewrites_3d, body = self._h
+        fg = self._fact_group
 
-        rule_delta = self._pending_rules
+        self._cumulative_rules = self._rule_group.add(self._cumulative_rules, self._pending_rules)
         self._pending_rules = ZSet({})
-        edb_delta = self._pending_edb
-        self._pending_edb = ZSet({})
-        self._cumulative_rules = self._rule_group.add(
-            self._cumulative_rules,
-            rule_delta,
-        )
+        outer, self._next_outer = self._next_outer, self._next_outer + 1
+        if self._pending_edb.inner:
+            e.push(edb_1d, self._pending_edb, t=(outer,))
+            self._pending_edb = ZSet({})
 
-        outer = self._next_outer
-        self._next_outer += 1
+        rules = {r: w for r, w in self._cumulative_rules.inner.items() if w > 0}
+        lv = stratum_levels(ZSet(rules))
+        top = max(lv.values(), default=0)
 
-        (
-            edb_1d,
-            program_1d,
-            state_level_3d,
-            sf_3d,
-            sr_3d,
-            _seed_1d,
-            level_out,
-            level_next,
-            guarded_delta_3d,
-            body_out,
-        ) = self._body_handles
+        seed = ZSet({(0, dlg._rewrite_monoid.identity()): 1})
+        stages: list[ZSet[dlg.Fact]] = []
+        cand = fg.identity()
+        for k in range(top + 1):
+            first_visit = k >= len(self._depth)
+            # keyed introduction: the rules of level k belong at cell k. The
+            # body integrates on axis 0, so push the DELTA against whatever
+            # this cell already holds -- a rule that changes level is a
+            # retraction at the old cell and an insertion at the new one.
+            placed = ZSet({r: w for r, w in rules.items() if lv[r[0][0]] == k})
+            prior = self._placed[k] if k < len(self._placed) else ZSet({})
+            delta_rules = self._rule_group.add(placed, self._rule_group.neg(prior))
+            if delta_rules.inner:
+                e.push(program_3d, delta_rules, t=(outer, k, 0))
+            while len(self._placed) <= k:
+                self._placed.append(ZSet({}))
+            self._placed[k] = placed
 
-        if rule_delta.inner:
-            self._body_e.push(program_1d, rule_delta, t=(outer,))
-        if edb_delta.inner:
-            self._body_e.push(edb_1d, edb_delta, t=(outer,))
-        frontiers = self._body_e.frontiers()
-        level_state_frontier = frontiers[state_level_3d]
-        body_state_frontier = frontiers[sf_3d]
+            if k > 0:
+                # stratum delay: cell k opens on the summed store of cell
+                # k - 1, again as a delta against what it opened on before.
+                prior_open = self._opened[k] if k < len(self._opened) else fg.identity()
+                delta_open = fg.add(cand, fg.neg(prior_open))
+                if delta_open.inner:
+                    e.push(facts_3d, delta_open, t=(outer, k, 0))
+                while len(self._opened) <= k:
+                    self._opened.append(fg.identity())
+                self._opened[k] = cand
+                if first_visit:
+                    e.push(rewrites_3d, seed, t=(outer, k, 0))
 
-        # Walk the stratum axis while the running level subgraph
-        # exposes work: clock stratum s if its historical frontier
-        # covers it OR the previous stratum produced negative-edge
-        # lookahead.
-        outer_delta = self._fact_group.identity()
-        inner_cursor = 0
-        s = 0
-        self._scheduled_strata.insert((0,))
-        while self._scheduled_strata.covers((s,)):
-            seed_ready = not self._ready_strata.covers((s,))
-            prior_stratum_depth = -1
-            if outer > 0:
-                prior_stratum_depth = max(
-                    _max_inner_before_outer(
-                        level_state_frontier,
-                        outer,
-                        s,
-                    ),
-                    _max_inner_before_outer(
-                        body_state_frontier,
-                        outer,
-                        s,
-                    ),
-                )
-            min_inner = max(prior_stratum_depth, inner_cursor - 1)
-            k = 0 if s == 0 else (prior_stratum_depth if prior_stratum_depth >= 0 else inner_cursor)
-            schedule_next = False
-            while k < self._max_inner:
-                diff_level = self._body_e.read(level_out, (outer, s, k))
-                next_level = self._body_e.read(level_next, (outer, s, k))
-                guarded_delta = self._body_e.read(
-                    guarded_delta_3d,
-                    (outer, s, k),
-                )
-                diff_facts, diff_rewrites = self._body_e.read(
-                    body_out,
-                    (outer, s, k),
-                )
-                state_seed = (
-                    _stratum_ready_delta(s) if seed_ready and k == inner_cursor else self._fact_group.identity()
-                )
-                empty = (
-                    not diff_level.inner
-                    and not next_level.inner
-                    and not guarded_delta.inner
-                    and not diff_facts.inner
-                    and not diff_rewrites.inner
-                    and not state_seed.inner
-                )
-                if next_level.inner:
-                    schedule_next = True
-                if empty and k > min_inner:
+            # An empty cell certifies the fixed point only past the depth
+            # earlier pushes reached: a doubly incremental operator reads the
+            # outer sum at its own depth, so below that an empty cell means
+            # "nothing new here", not "converged".
+            # Track actual support, not the empty tick that certifies it.
+            # The feedback delay can expose that support one tick later.
+            deepest = self._depth[k] if not first_visit else -1
+            if k > 0 and (delta_open.inner or first_visit):
+                deepest = max(deepest, 0)
+            floor = deepest + 1
+            total = fg.identity()
+            j = 0 if k == 0 else 1
+            while j < self._max_inner:
+                df, dr = e.read(body, (outer, k, j))
+                if not df.inner and not dr.inner and j > floor:
                     break
-                if diff_facts.inner:
-                    public_diff = _without_internal_facts(diff_facts)
-                    outer_delta = self._fact_group.add(
-                        outer_delta,
-                        public_diff,
-                    )
-                self._body_e.push(
-                    state_level_3d,
-                    diff_level,
-                    t=(outer, s, k),
-                )
-                state_facts = self._fact_group.add(diff_facts, state_seed)
-                self._body_e.push(sf_3d, state_facts, t=(outer, s, k))
-                self._body_e.push(sr_3d, diff_rewrites, t=(outer, s, k))
-                k += 1
+                if df.inner or dr.inner:
+                    deepest = max(deepest, j)
+                    total = fg.add(total, df)
+                    if df.inner:
+                        e.push(facts_3d, df, t=(outer, k, j))
+                    if dr.inner:
+                        e.push(rewrites_3d, dr, t=(outer, k, j))
+                j += 1
             else:
-                raise RuntimeError(f"stratum {s} at outer {outer} did not converge in {self._max_inner} inner ticks")
-            inner_cursor = k
-            if schedule_next:
-                self._scheduled_strata.insert((s + 1,))
-            self._ready_strata.insert((s,))
-            s += 1
+                raise RuntimeError(f"stratum {k} did not converge in {self._max_inner} inner ticks")
 
-        self._cumulative_facts = self._fact_group.add(
-            self._cumulative_facts,
-            outer_delta,
-        )
+            # Two accumulations meet here and must not be confused. Along the
+            # stratum axis, cell k's store is what it inherited from k - 1 plus
+            # what k derives. Along the push axis, what k derives accumulates
+            # over outer ticks, because the body emits deltas. So the
+            # elimination on the iteration axis feeds the per-cell running
+            # total, and the stratum store is the inherited store plus that.
+            while len(self._depth) <= k:
+                self._depth.append(-1)
+            self._depth[k] = deepest
+            prev_derived = self._derived[k] if k < len(self._derived) else fg.identity()
+            derived = fg.add(prev_derived, total)
+            while len(self._derived) <= k:
+                self._derived.append(fg.identity())
+            self._derived[k] = derived
+            cand = fg.add(cand, derived)
+            stages.append(cand)
+
+        self._stages = stages
+        self._cumulative_facts = cand
         return self._cumulative_facts
+
+    def stage(self, k: int) -> ZSet[dlg.Fact]:
+        """The ``k``-th stage. Cells at or above the top level repeat the
+        full stratified model, so the list is read saturating."""
+        if not self._stages:
+            self.saturate()
+        return self._stages[min(k, len(self._stages) - 1)]
 
 
 class IndexedIncrementalDatalogStratified(IncrementalDatalogStratified):
     """Drop-in for :class:`IncrementalDatalogStratified` whose body uses the
-    SORT-MERGE-indexed joins (:class:`IndexedIncrementalDatalogBodyWithNegation`).
-    Identical API, identical results — only the per-saturation join cost differs
-    (O(matching keys) vs O(|left|·|right|)), so it scales to large dense EDBs."""
+    SORT-MERGE-indexed joins
+    (:class:`~pydbsp.indexed_relational_operators.IndexedIncrementalDatalogWithNegationBody`
+    at ``inner_axis=2``). Identical API, identical results — only the
+    per-saturation join cost differs (O(matching keys) vs O(|left|·|right|)),
+    so it scales to large dense EDBs."""
 
     _indexed = True
 

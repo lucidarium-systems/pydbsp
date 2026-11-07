@@ -1600,7 +1600,7 @@ wheels = [
 
 [[package]]
 name = "pydbsp"
-version = "2.1.0"
+version = "2.1.4"
 source = { editable = "." }
 
 [package.dev-dependencies]

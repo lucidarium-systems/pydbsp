@@ -1,8 +1,8 @@
 """IndexedIncrementalDatalogStratified ≡ IncrementalDatalogStratified.
 
-The indexed driver swaps the non-indexed 3-D negation body for the sort-merge-indexed
-one (`IndexedIncrementalDatalogBodyWithNegation`, built on the 3-D indexed join
-`IndexedDeltaLiftedDeltaLiftedDeltaLiftedJoin`). It must produce BYTE-IDENTICAL results —
+The indexed driver swaps the non-indexed negation body for the sort-merge-indexed
+one (`IndexedIncrementalDatalogWithNegationBody` at `inner_axis=2`, built on
+`IndexedDeltaLiftedDeltaLiftedJoin`). It must produce BYTE-IDENTICAL results —
 only the join cost changes. This battery runs positive recursion, negation, multi-level
 stratified negation, and a realistic reaching-defs program through BOTH and asserts the
 full saturated fact set is identical.
